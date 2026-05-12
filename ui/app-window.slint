@@ -19,25 +19,27 @@ export component AppWindow inherits Window {
     in-out property <bool> enable-cancel-btn: false;
 
     // 状态组
-    in-out property <bool> is-downloading: false;
+    in-out property <bool> in-progress: false;
     in-out property <bool> is-pause: false;
     in-out property <bool> has-failed-file: false;
+
     in-out property <bool> is-merge: false;
     in-out property <bool> is-delete-segment: false;
 
     // 输入组（后端可读可写）
-    in-out property <string> work-dir;
-    // in-out property <string> work-dir: "F:\\temp";
+    // in-out property <string> work-dir;
+    in-out property <string> work-dir: "F:\\temp";
     in-out property <int> total_nums;
     in-out property <int> downloaded_nums;
     in-out property <string> content-length;
 
     // 输入组（后端只读）
-    out property <string> m3u8-url;
-    // out property <string> m3u8-url: "http://localhost/res/videos/m3u8/8/index.m3u8";
-    out property <string> video-name;
-    // out property <string> video-name: "m3u8test";
-    out property <string> threads;
+    // out property <string> m3u8-url;
+    out property <string> m3u8-url: "http://localhost/res/tmp/index.m3u8";
+    // out property <string> m3u8-url: "https://hn.bfvvs.com/play/lej2mZze/index.m3u8";
+    // out property <string> video-name;
+    out property <string> video-name: "m3u8test";
+    out property <string> concurrency;
     out property <string> retry;
     out property <string> timeout;
     out property <string> message;
@@ -49,14 +51,53 @@ export component AppWindow inherits Window {
     // 回调函数
     callback select-dir();
     callback open-failed-file();
-    callback start-download();
+    callback start-download(bool);
     callback pause-download();
     callback cancel-download();
-
+    callback default-state();
+    callback parse-state();
+    callback downloading-state();
+    callback paused-state();
     callback show-message(string, bool);
+
+    // 格式化消息
     show-message(msg, err) => {
-        root.message = msg;
-        root.is-err-msg = err;
+        message = msg;
+        is-err-msg = err;
+    }
+
+    // 默认状态
+    default-state() => {
+        enable-start-btn = true;
+        enable-pause-btn = false;
+        enable-cancel-btn = false;
+        is-pause = false;
+        has-failed-file = false;
+        in-progress = false;
+    }
+
+    // 解析状态
+    parse-state() => {
+        enable-start-btn = false;
+        enable-pause-btn = false;
+        enable-cancel-btn = false;
+        in-progress = true;
+    }
+
+    // 下载中
+    downloading-state() => {
+        enable-start-btn = false;
+        enable-pause-btn = true;
+        enable-cancel-btn = true;
+        is-pause = false;
+    }
+
+    // 暂停中
+    paused-state() => {
+        enable-start-btn = true;
+        enable-pause-btn = false;
+        enable-cancel-btn = true;
+        is-pause = true;
     }
 
     // 总布局
@@ -84,10 +125,10 @@ export component AppWindow inherits Window {
                         LineEdit {
                             text <=> root.work-dir;
                             read-only: true;
-                            enabled: !root.is-downloading;
+                            enabled: !root.in-progress;
                         }
                         Button {
-                            enabled: !root.is-downloading;
+                            enabled: !root.in-progress;
                             text: "选择";
                             clicked => { root.select-dir(); }
                         }
@@ -107,7 +148,7 @@ export component AppWindow inherits Window {
                         LineEdit {
                             text <=> root.video-name;
                             colspan: 2;
-                            enabled: !root.is-downloading;
+                            enabled: !root.in-progress;
                         }
                     }
                     // M3U8 URL
@@ -125,21 +166,21 @@ export component AppWindow inherits Window {
                         LineEdit {
                             text <=> root.m3u8-url;
                             colspan: 2;
-                            enabled: !root.is-downloading;
+                            enabled: !root.in-progress;
                         }
                     }
-                    // 线程数
+                    // 并发数
                     Row {
                         Rectangle {
                             Text {
-                                text: "线程数";
+                                text: "并发数";
                             }
                         }
                         LineEdit {
-                            text <=> root.threads;
+                            text <=> root.concurrency;
                             input-type: number;
                             colspan: 2;
-                            enabled: !root.is-downloading || root.is-pause;
+                            enabled: !root.in-progress;
                             placeholder-text: "4";
                         }
                     }
@@ -154,7 +195,7 @@ export component AppWindow inherits Window {
                             text <=> root.retry;
                             input-type: number;
                             colspan: 2;
-                            enabled: !root.is-downloading || root.is-pause;
+                            enabled: !root.in-progress;
                             placeholder-text: "3";
                         }
                     }
@@ -169,7 +210,7 @@ export component AppWindow inherits Window {
                             text <=> root.timeout;
                             input-type: number;
                             colspan: 2;
-                            enabled: !root.is-downloading || root.is-pause;
+                            enabled: !root.in-progress;
                             placeholder-text: "3";
                         }
                     }
@@ -179,7 +220,7 @@ export component AppWindow inherits Window {
                     CheckBox {
                         text: "下载完成后合并为MP4";
                         checked <=> root.is-merge;
-                        enabled: !root.is-downloading || root.is-pause;
+                        enabled: !root.in-progress;
                         toggled() => {
                             if !self.checked && root.is-delete-segment {
                                 root.is-delete-segment = false;
@@ -189,7 +230,7 @@ export component AppWindow inherits Window {
                     CheckBox {
                         text: "合并后删除分片";
                         checked <=> root.is-delete-segment;
-                        enabled: root.is-merge && (!root.is-downloading || root.is-pause);
+                        enabled: root.is-merge && !root.in-progress;
                     }
                 }
                 // 按钮事件操作
@@ -198,7 +239,7 @@ export component AppWindow inherits Window {
                         text: root.is-pause ? "继续下载" : "下载";
                         enabled: root.enable-start-btn && !root.work-dir.is-empty && !root.video-name.is-empty && !root.m3u8-url.is-empty;
                         primary: true;
-                        clicked => { root.start-download(); }
+                        clicked => { root.start-download(root.is-pause); }
                     }
                     Button {
                         text: "暂停";
@@ -254,7 +295,7 @@ export component AppWindow inherits Window {
                 }
                 Text {
                     y: 160px;
-                    text: "Version 0.1.0";
+                    text: "Version 0.1.1";
                 }
                 Text {
                     y: 180px;

@@ -1,15 +1,18 @@
 [package]
 name = "m3u8downloader"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
-slint = { version = "1.16.0", default-features = false, features = ["compat-1-2", "std", "backend-default", "renderer-femtovg"] }
-rfd = "0.17.2"
-reqwest = { version = "0.13", features = ["blocking", "stream"] }
-url = "2.5.8"
+async-compat = "0.2.5"
 regex = "1.12.3"
+reqwest = "0.13.3"
+rfd = "0.17.2"
+slint = { version = "1.16.1", default-features = false, features = ["std", "compat-1-2", "backend-default", "renderer-femtovg"] }
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "fs", "process"] }
+url = "2.5.8"
 winsafe = { version = "0.0.27", features = ["user"] }
+futures = { version = "0.3", default-features = false }
 
 [build-dependencies]
 slint-build = "1.16.0"
