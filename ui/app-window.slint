@@ -54,11 +54,19 @@ export component AppWindow inherits Window {
     callback start-download(bool);
     callback pause-download();
     callback cancel-download();
-    callback default-state();
-    callback parse-state();
-    callback downloading-state();
+    callback parsed-state(string, int);
     callback paused-state();
+    callback canceled-state();
+    callback downloaded-state(string, bool);
     callback show-message(string, bool);
+
+    function init-state() {
+        enable-start-btn = true;
+        enable-pause-btn = false;
+        enable-cancel-btn = false;
+        is-pause = false;
+        in-progress = false;
+    }
 
     // 格式化消息
     show-message(msg, err) => {
@@ -66,38 +74,37 @@ export component AppWindow inherits Window {
         is-err-msg = err;
     }
 
-    // 默认状态
-    default-state() => {
-        enable-start-btn = true;
-        enable-pause-btn = false;
-        enable-cancel-btn = false;
-        is-pause = false;
+    // 已取消
+    canceled-state() => {
+        init-state();
         has-failed-file = false;
-        in-progress = false;
+        total_nums = 0;
+        downloaded_nums = 0;
+        content-length = "";
+        show-message("你已取消下载", false);
     }
 
-    // 解析状态
-    parse-state() => {
-        enable-start-btn = false;
-        enable-pause-btn = false;
-        enable-cancel-btn = false;
-        in-progress = true;
-    }
-
-    // 下载中
-    downloading-state() => {
-        enable-start-btn = false;
+    // 解析完毕
+    parsed-state(a, b) => {
         enable-pause-btn = true;
         enable-cancel-btn = true;
-        is-pause = false;
+        show-message(a, false);
+        total_nums = b;
     }
 
-    // 暂停中
+    // 已暂停
     paused-state() => {
         enable-start-btn = true;
-        enable-pause-btn = false;
         enable-cancel-btn = true;
         is-pause = true;
+        show-message("你已暂停下载", false);
+    }
+
+    // 下载完毕
+    downloaded-state(a, b) => {
+        init-state();
+        show-message(a, false);
+        has-failed-file = b;
     }
 
     // 总布局

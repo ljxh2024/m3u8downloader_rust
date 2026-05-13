@@ -15,7 +15,7 @@ winsafe = { version = "0.0.27", features = ["user"] }
 futures = { version = "0.3", default-features = false }
 
 [build-dependencies]
-slint-build = "1.16.0"
+slint-build = "1.16.1"
 
 [profile.release]
 debug = false

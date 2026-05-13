@@ -1,3 +1,4 @@
+use futures::stream::{FuturesUnordered, StreamExt};
 use regex::Regex;
 use reqwest::Client;
 use slint::{PhysicalPosition, SharedString};
@@ -6,20 +7,19 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicU32, Ordering},
     },
 };
 use tokio::{
     fs::{self, File, OpenOptions},
     io::{self, AsyncWriteExt, BufWriter},
     process::Command,
-    sync::{Mutex, Semaphore, mpsc, Notify},
+    sync::{Mutex, Notify, Semaphore, mpsc},
     task::JoinHandle,
     time::{Duration, sleep},
 };
 use url::Url;
 use winsafe::{GetSystemMetrics, co::SM};
-use futures::stream::{FuturesUnordered, StreamExt};
 
 slint::include_modules!();
 
@@ -52,7 +52,16 @@ pub fn run() -> Result<(), slint::PlatformError> {
         move |is_pause| {
             let ui = ui_weak.unwrap();
 
-            ui.invoke_parse_state();
+            ui.set_enable_start_btn(false);
+            ui.set_in_progress(true);
+            ui.set_has_failed_file(false);
+
+            let msg = if is_pause {
+                "继续下载..."
+            } else {
+                "正在解析..."
+            };
+            ui.invoke_show_message(msg.into(), false);
 
             let tx_start = tx_start.clone();
             slint::spawn_local(async_compat::Compat::new(async move {
@@ -89,7 +98,11 @@ pub fn run() -> Result<(), slint::PlatformError> {
         let tx_pause = tx.clone();
 
         move || {
-            ui_weak.unwrap().invoke_paused_state();
+            let ui = ui_weak.unwrap();
+
+            ui.set_enable_pause_btn(false);
+            ui.set_enable_cancel_btn(false);
+            ui.invoke_show_message("正在暂停...".into(), false);
 
             let tx_pause = tx_pause.clone();
             slint::spawn_local(async_compat::Compat::new(async move {
@@ -106,8 +119,11 @@ pub fn run() -> Result<(), slint::PlatformError> {
 
         move || {
             let ui = ui_weak.unwrap();
-            
-            ui.invoke_default_state();
+
+            ui.set_enable_start_btn(false);
+            ui.set_enable_pause_btn(false);
+            ui.set_enable_cancel_btn(false);
+            ui.invoke_show_message("正在取消...".into(), false);
 
             let tx_cancel = tx_cancel.clone();
             slint::spawn_local(async_compat::Compat::new(async move {
@@ -165,15 +181,16 @@ pub fn run() -> Result<(), slint::PlatformError> {
 // 信道消息类型
 enum ChannelMessage {
     ParseDownload(RequestData),
-    PrepareDownloadSegment {
-        total_segment_nums: u32,
+    Parsed {
+        total_nums: u32,
         has_master_playlist: bool,
     },
     Pause,
     Continue,
     Cancel,
-    // ReleaseTask,
-    SegmentDownloaded {
+    ReleaseTask,
+    Downloaded {
+        downloaded_nums: i32, // 已下载分片数，直接在UI界面显示
         content_length: u64,
     },
 }
@@ -200,40 +217,21 @@ struct Segment {
 
 // 下载任务配置
 struct DownloadTask {
-    total_segment_nums: u32,
-    failed_segment_nums: u32,
-    // downloaded_segments: Vec<String>,
-    // segments: Mutex<Vec<Segment>>,
-    // downloaded_segments: Mutex<Vec<String>>,
-    // failed_segments: Mutex<Vec<String>>,
-    // is_new_download: AtomicBool,
-    // is_pause: AtomicBool,
-    // is_cancel: AtomicBool,
-    // is_parse_fail: AtomicBool,
+    total_nums: AtomicU32,
+    downloaded_segments: Mutex<Vec<String>>, // 已下载的分片，存储分片名
+    state: AtomicU8,                         // 1下载中，2暂停，3取消
+    notify: Notify,
 }
 
 impl DownloadTask {
     fn new() -> Self {
         Self {
-            total_segment_nums: 0,
-            failed_segment_nums: 0,
-            // downloaded_segments: Vec::new(),
-            // segments: Mutex::new(Vec::new()),
-            // downloaded_segments: Mutex::new(Vec::new()),
-            // failed_segments: Mutex::new(Vec::new()),
-            // is_new_download: AtomicBool::new(true),
-            // is_pause: AtomicBool::new(false),
-            // is_cancel: AtomicBool::new(false),
-            // is_parse_fail: AtomicBool::new(false),
+            total_nums: AtomicU32::new(0),
+            downloaded_segments: Mutex::new(Vec::new()),
+            state: AtomicU8::new(1),
+            notify: Notify::new(),
         }
     }
-}
-
-// 合并配置
-struct MergeConfig {
-    args: Vec<String>,
-    delete_segment: bool,
-    save_path: Arc<Path>,
 }
 
 // 监控信道，处理下载、暂停、取消
@@ -243,541 +241,311 @@ async fn loop_receive_message(
     ui_weak: slint::Weak<AppWindow>,
 ) {
     // 初始化任务配置
-    let download_task = Arc::new(Mutex::new(DownloadTask::new()));
+    let download_task = Arc::new(DownloadTask::new());
     // 当前已下载的文件大小
     let mut current_content_length: u64 = 0;
-    // 已下载的分片数
-    let mut downloaded_nums: u32 = 0;
     // 下载任务句柄
-    // let master_task: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
-    // 暂停通知
-    let notify = Arc::new(Notify::new());
-    // 下载状态 1下载中，2暂停，3取消
-    let download_state = Arc::new(AtomicU8::new(1));
+    let master_task: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 
     while let Some(channel_message) = rx.recv().await {
         match channel_message {
             // 解析
             ChannelMessage::ParseDownload(request_data) => {
-                ui_weak.upgrade_in_event_loop(move |ui| {
-                    ui.invoke_show_message("正在解析...".into(), false);
-                }).unwrap();
-                
                 let ui_weak_clone = ui_weak.clone();
                 let tx_clone = tx.clone();
-                let notify_clone = Arc::clone(&notify);
                 let download_task_clone = Arc::clone(&download_task);
-                let download_state_clone =  Arc::clone(&download_state);
 
                 current_content_length = 0;
-                downloaded_nums = 0;
 
-                tokio::spawn(async move {
-                    match start_parse_download(download_task_clone, request_data, tx_clone, notify_clone, download_state_clone).await {
-                        Ok(_) => {
-                            println!("111");
-                        }
-                        Err(e) => {
-                            let err_msg = e.to_string();
-                            ui_weak_clone.upgrade_in_event_loop(move |ui| {
-                                ui.invoke_default_state();
+                let task = tokio::spawn(async move {
+                    let mut err_flag = false;
+
+                    if let Err(e) =
+                        start_parse_download(&download_task_clone, &request_data, tx_clone.clone())
+                            .await
+                    {
+                        err_flag = true;
+                        let err_msg = e.to_string();
+                        ui_weak_clone
+                            .upgrade_in_event_loop(move |ui| {
                                 ui.invoke_show_message(err_msg.into(), true);
-                            }).unwrap();
+                            })
+                            .unwrap();
+                    }
+
+                    tx_clone.send(ChannelMessage::ReleaseTask).await.unwrap();
+
+                    if err_flag {
+                        return;
+                    }
+
+                    // 暂停下载
+                    if download_task_clone.state.load(Ordering::Relaxed) == 2 {
+                        ui_weak_clone
+                            .upgrade_in_event_loop(move |ui| {
+                                ui.invoke_paused_state();
+                            })
+                            .unwrap();
+                        return;
+                    }
+
+                    // 取消下载
+                    if download_task_clone.state.load(Ordering::Relaxed) == 3 {
+                        ui_weak_clone
+                            .upgrade_in_event_loop(move |ui| {
+                                ui.invoke_canceled_state();
+                            })
+                            .unwrap();
+                        return;
+                    }
+
+                    // 任务正常结束
+                    // 构建最终消息
+                    let mut final_msg = String::from("所有分片已下载完毕");
+
+                    let (downloaded_segments, total_nums) = {
+                        let guard = download_task_clone.downloaded_segments.lock().await;
+                        (
+                            guard.clone(),
+                            download_task_clone.total_nums.load(Ordering::Relaxed),
+                        )
+                    };
+
+                    let failed_nums = total_nums - downloaded_segments.len() as u32;
+
+                    if failed_nums > 0 {
+                        final_msg = format!("有 {} 个分片下载失败", failed_nums);
+                    } else {
+                        // 合并为MP4
+                        if request_data.is_merge {
+                            let m3u8_path = &request_data
+                                .save_path
+                                .join(M3U8_FILENAME)
+                                .to_str()
+                                .unwrap()
+                                .to_string();
+                            let mp4_path = request_data
+                                .save_path
+                                .join(format!("{}.mp4", request_data.video_name))
+                                .to_str()
+                                .unwrap()
+                                .to_string();
+                            let args = vec![
+                                "-allowed_extensions",
+                                "ALL",
+                                "-i",
+                                &m3u8_path,
+                                "-c",
+                                "copy",
+                                "-y",
+                                &mp4_path,
+                            ];
+
+                            match merge_and_delete(
+                                args,
+                                request_data.is_delete_segment,
+                                &downloaded_segments,
+                                &request_data.save_path,
+                            )
+                            .await
+                            {
+                                Ok(msg) => {
+                                    final_msg = msg;
+                                }
+                                Err(e) => match e.kind() {
+                                    io::ErrorKind::NotFound => {
+                                        final_msg = String::from("合并失败：未找到FFmpeg命令");
+                                    }
+                                    _ => final_msg = e.to_string(),
+                                },
+                            }
                         }
                     }
+
+                    // 更新UI
+                    ui_weak_clone
+                        .upgrade_in_event_loop(move |ui| {
+                            ui.invoke_downloaded_state(final_msg.into(), failed_nums > 0);
+                        })
+                        .unwrap();
                 });
-
-                // match 
-                // let download_task1 = Arc::clone(&download_task);
-                // let notify_clone = Arc::clone(&notify);
-                // let tx1 = tx.clone();
-                // let ui_weak = ui_weak.clone();
-
-                // download_task1.is_parse_fail.swap(false, Ordering::Relaxed);
-                // download_task1.is_pause.swap(false, Ordering::Relaxed);
-                // download_task1.is_cancel.swap(false, Ordering::Relaxed);
-                // download_task1.failed_segments.lock().await.clear();
-
-                // if download_task1.is_new_download.load(Ordering::Relaxed) {
-                //     current_content_length = 0;
-                // }
-
-                // // 构建合并MP4参数
-                // let merge_config = if request_data.is_merge {
-                //     let m3u8_path = request_data.save_path.join(M3U8_FILENAME);
-                //     let mp4_path = request_data
-                //         .save_path
-                //         .join(format!("{}.mp4", request_data.video_name));
-
-                //     let args = vec![
-                //         "-allowed_extensions".to_string(),
-                //         "ALL".to_string(),
-                //         "-i".to_string(),
-                //         m3u8_path.to_str().unwrap().to_string(),
-                //         "-c".to_string(),
-                //         "copy".to_string(),
-                //         "-y".to_string(),
-                //         mp4_path.to_str().unwrap().to_string(),
-                //     ];
-
-                //     Some(MergeConfig {
-                //         args,
-                //         delete_segment: request_data.is_delete_segment,
-                //         save_path: request_data.save_path.clone(),
-                //     })
-                // } else {
-                //     None
-                // };
-
-                // let task = tokio::spawn(async move {
-                //     let download_task2 = Arc::clone(&download_task1);
-
-                //     // 解析下载
-                //     if let Err(e) =
-                //         parse_and_download(Arc::clone(&download_task1), request_data, tx1.clone(), Arc::clone(&notify_clone))
-                //             .await
-                //     {
-                //         download_task2.is_parse_fail.swap(true, Ordering::Relaxed);
-                //         let err_msg = e.to_string();
-                //         ui_weak
-                //             .upgrade_in_event_loop(move |ui| {
-                //                 ui.invoke_show_message(err_msg.into(), true);
-                //                 ui.set_is_downloading(false);
-                //                 ui.set_enable_start_btn(true);
-                //             })
-                //             .unwrap();
-                //     }
-
-                //     // 下载任务完成，等待释放
-                //     tx1.send(ChannelMessage::ReleaseTask).await.unwrap();
-
-                //     // 解析失败
-                //     if download_task1.is_parse_fail.load(Ordering::Relaxed) {
-                //         return;
-                //     }
-
-                //     // 暂停处理
-                //     // if download_task1.is_pause.load(Ordering::Relaxed) {
-                //     //     ui_weak
-                //     //         .upgrade_in_event_loop(move |ui| {
-                //     //             ui.invoke_show_message("已暂停".into(), false);
-                //     //             ui.set_is_pause(true);
-                //     //             ui.set_enable_start_btn(true);
-                //     //         })
-                //     //         .unwrap();
-                //     //     return;
-                //     // }
-
-                //     // 取消处理
-                //     if download_task1.is_cancel.load(Ordering::Relaxed) {
-                //         reset_download_status(
-                //             &ui_weak,
-                //             &download_task1,
-                //             SharedString::from("已取消"),
-                //             true,
-                //         )
-                //         .await;
-                //         return;
-                //     }
-
-                //     // 正常下载结束
-                //     let (downloaded_segments, segment_nums) = {
-                //         let guard = download_task1.downloaded_segments.lock().await;
-                //         (guard.clone(), download_task1.segments.lock().await.len())
-                //     };
-                //     if downloaded_segments.len() == segment_nums {
-                //         let mut message = String::from("所有分片已下载完毕");
-                //         // 合并为MP4
-                //         if let Some(config) = merge_config {
-                //             ui_weak
-                //                 .upgrade_in_event_loop(move |ui| {
-                //                     ui.invoke_show_message("正在合并为MP4...".into(), false);
-                //                 })
-                //                 .unwrap();
-                //             // 使用ffmpeg合并为MP4
-                //             match merge_and_delete(
-                //                 config.args,
-                //                 config.delete_segment,
-                //                 downloaded_segments,
-                //                 config.save_path,
-                //             )
-                //             .await
-                //             {
-                //                 Ok(msg) => {
-                //                     message = msg;
-                //                 }
-                //                 Err(e) => match e.kind() {
-                //                     io::ErrorKind::NotFound => {
-                //                         message = String::from("合并失败：未找到FFmpeg命令");
-                //                     }
-                //                     _ => {
-                //                         message = e.to_string();
-                //                     }
-                //                 },
-                //             }
-                //         }
-                //         reset_download_status(
-                //             &ui_weak,
-                //             &download_task1,
-                //             SharedString::from(message),
-                //             false,
-                //         )
-                //         .await;
-                //     } else {
-                //         // 有分片下载失败了
-                //         reset_download_status(
-                //             &ui_weak,
-                //             &download_task1,
-                //             SharedString::new(),
-                //             false,
-                //         )
-                //         .await;
-                //     }
-                // });
-                // *master_task.lock().await = Some(task);
+                *master_task.lock().await = Some(task);
             }
             // 解析完毕，准备下载
-            ChannelMessage::PrepareDownloadSegment {
-                total_segment_nums,
+            ChannelMessage::Parsed {
+                total_nums,
                 has_master_playlist,
             } => {
-                let msg = format!("正在下载分片{}...", if has_master_playlist { "（已选择最高分辨率）" } else { "" });
+                let msg = format!(
+                    "正在下载分片{}...",
+                    if has_master_playlist {
+                        "（已选择最高分辨率）"
+                    } else {
+                        ""
+                    }
+                );
 
                 ui_weak
                     .upgrade_in_event_loop(move |ui| {
-                        ui.invoke_show_message(msg.into(), false);
-                        ui.set_total_nums(total_segment_nums as i32);
-                        ui.invoke_downloading_state();
+                        ui.invoke_parsed_state(msg.into(), total_nums as i32);
                     })
                     .unwrap();
             }
             // 某个分片下载完成
-            ChannelMessage::SegmentDownloaded { content_length} => {
+            ChannelMessage::Downloaded {
+                downloaded_nums,
+                content_length,
+            } => {
                 current_content_length += content_length;
-                downloaded_nums += 1;
 
                 ui_weak
                     .upgrade_in_event_loop(move |ui| {
-                        ui.set_downloaded_nums(downloaded_nums as i32);
+                        ui.set_downloaded_nums(downloaded_nums);
                         ui.set_content_length(byte_convert(current_content_length).into());
                     })
                     .unwrap();
             }
             // 暂停
             ChannelMessage::Pause => {
-                // download_task.is_pause.swap(true, Ordering::Relaxed);
-                download_state.store(2, Ordering::Relaxed);
-                ui_weak
-                    .upgrade_in_event_loop(move |ui| {
-                        ui.invoke_show_message("你已暂停下载".into(), false);
-                    })
-                    .unwrap();
+                download_task.state.store(2, Ordering::Relaxed);
             }
             // 继续
             ChannelMessage::Continue => {
-                // download_task.is_pause.swap(false, Ordering::Relaxed);
-                download_state.store(1, Ordering::Relaxed);
-                notify.notify_waiters();
-
+                download_task.state.store(1, Ordering::Relaxed);
+                download_task.notify.notify_waiters();
                 ui_weak
                     .upgrade_in_event_loop(move |ui| {
-                        ui.invoke_show_message("继续下载...".into(), false);
-                        ui.invoke_downloading_state();
+                        ui.set_enable_pause_btn(true);
+                        ui.set_enable_cancel_btn(true);
                     })
                     .unwrap();
             }
             // 取消
             ChannelMessage::Cancel => {
-                // download_task.is_cancel.swap(true, Ordering::Relaxed);
-                download_state.store(3, Ordering::Relaxed);
-
-                ui_weak
-                    .upgrade_in_event_loop(move |ui| {
-                        ui.invoke_show_message("你已取消下载".into(), false);
-                        ui.invoke_default_state();
-                    })
-                    .unwrap();
+                let old_state = download_task.state.swap(3, Ordering::SeqCst);
+                if old_state == 2 {
+                    download_task.notify.notify_waiters();
+                }
             }
             // 释放任务
-            // ChannelMessage::ReleaseTask => {
-            //     // if let Some(task) = master_task.lock().await.take() {
-            //     //     task.await.unwrap();
-            //     //     println!("ReleaseTask");
-            //     // }
-            // }
+            ChannelMessage::ReleaseTask => {
+                if let Some(task) = master_task.lock().await.take() {
+                    task.await.unwrap();
+                }
+            }
         }
     }
 }
 
 // 解析+下载
 async fn start_parse_download(
-    download_task: Arc<Mutex<DownloadTask>>,
-    request_data: RequestData,
+    download_task: &Arc<DownloadTask>,
+    request_data: &RequestData,
     tx: mpsc::Sender<ChannelMessage>,
-    notify: Arc<Notify>,
-    download_state: Arc<AtomicU8>,
 ) -> Result<(), Box<dyn Error>> {
     // 总分片（含KEY）、是否存在大师列表
-    let (segments, has_master_playlist) = parse_m3u8(&request_data.m3u8_url, &request_data.save_path, request_data.timeout).await?;
-    let total_segment_nums = segments.len() as u32;
+    let (segments, has_master_playlist) = parse_m3u8(
+        &request_data.m3u8_url,
+        &request_data.save_path,
+        request_data.timeout,
+    )
+    .await?;
+    let total_nums = segments.len() as u32;
 
-    download_task.lock().await.total_segment_nums = total_segment_nums;
+    download_task
+        .total_nums
+        .store(total_nums, Ordering::Relaxed);
+    download_task.downloaded_segments.lock().await.clear();
+    download_task.state.store(1, Ordering::Relaxed);
 
-    let client = Arc::new(Client::builder().connect_timeout(Duration::from_secs(request_data.timeout)).user_agent(APP_USER_AGENT).build()?);
+    let client = Arc::new(
+        Client::builder()
+            .connect_timeout(Duration::from_secs(request_data.timeout))
+            .user_agent(APP_USER_AGENT)
+            .build()?,
+    );
 
     let failed_filepath = request_data.save_path.join(FAILED_FILENAME);
     if failed_filepath.is_file() {
         fs::remove_file(failed_filepath).await?;
     }
 
-    tx.send(ChannelMessage::PrepareDownloadSegment { total_segment_nums, has_master_playlist }).await?;
+    tx.send(ChannelMessage::Parsed {
+        total_nums,
+        has_master_playlist,
+    })
+    .await?;
 
     let mut futures = FuturesUnordered::new();
     let semaphore = Arc::new(Semaphore::new(request_data.concurrency));
 
     for segment in segments {
         let client_clone = Arc::clone(&client);
-        let download_task_clone = Arc::clone(&download_task);
         let semaphore_clone = Arc::clone(&semaphore);
-        let notify_clone = Arc::clone(&notify);
-        let download_state_clone = Arc::clone(&download_state);
         let tx_clone = tx.clone();
 
         let future = async move {
-            loop {
-                // 获取一个信号量许可
-                let _permit = semaphore_clone.acquire().await.unwrap();
+            // 获取一个信号量许可
+            let _permit = semaphore_clone.acquire().await.unwrap();
 
-                // 暂停
-                if download_state_clone.load(Ordering::Relaxed) == 2 {
-                    notify_clone.notified().await;
-                }
-
-                // 取消
-                if download_state_clone.load(Ordering::Relaxed) == 3 {
-                    break;
-                }
-
-                download_single_segment(segment, client_clone, download_task_clone, request_data.retry, tx_clone).await;
-                break;
+            // 暂停
+            if download_task.state.load(Ordering::Relaxed) == 2 || download_task.state.load(Ordering::Relaxed) == 3 {
+                // download_task.notify.notified().await;
+                return;
             }
+
+            // 下载单个分片
+            download_single_segment(
+                segment,
+                &client_clone,
+                download_task,
+                request_data.retry,
+                tx_clone,
+            )
+            .await;
         };
 
         futures.push(future);
     }
 
-    while let Some(_) = futures.next().await {}
+    while futures.next().await.is_some() {}
 
     Ok(())
-    // let mut exist_max_resolution = false;
-
-    // // 初始化待下载的分片和总分片数
-    // let (segments, total_nums) = if download_task.is_new_download.load(Ordering::Relaxed) {
-    //     // 获取并解析M3U8文件
-    //     let (segments, is_exist_max_resolution) = parse_m3u8(
-    //         &request_data.m3u8_url,
-    //         &request_data.save_path,
-    //         request_data.timeout,
-    //     )
-    //     .await?;
-    //     exist_max_resolution = is_exist_max_resolution;
-    //     let len = segments.len();
-    //     *download_task.segments.lock().await = segments.clone();
-    //     (segments, len)
-    // } else {
-    //     let total_segments = download_task.segments.lock().await;
-    //     let len = total_segments.len();
-    //     let downloaded_segments = download_task.downloaded_segments.lock().await;
-    //     (
-    //         total_segments
-    //             .iter()
-    //             .filter(|&item| !downloaded_segments.contains(&item.segment_name))
-    //             .cloned()
-    //             .collect(),
-    //         len,
-    //     )
-    // };
-
-    // let failed_filepath = request_data.save_path.join(FAILED_FILENAME);
-    // if failed_filepath.is_file() {
-    //     fs::remove_file(failed_filepath).await.unwrap();
-    // }
-
-    // let client = Arc::new(
-    //     Client::builder()
-    //         .connect_timeout(Duration::from_secs(request_data.timeout))
-    //         .user_agent(APP_USER_AGENT)
-    //         .build()?,
-    // );
-
-    // // 通知UI，正在下载分片
-    // let _ = tx
-    //     .send(ChannelMessage::PrepareDownloadSegment {
-    //         total_nums,
-    //         exist_max_resolution,
-    //     })
-    //     .await;
-
-    // let mut futures = FuturesUnordered::new();
-    // // 创建信号量，限制最大并发数
-    // let semaphore = Arc::new(Semaphore::new(request_data.concurrency));
-
-    // for segment in segments {
-        // let client = Arc::clone(&client);
-        // let tx = tx.clone();
-        // let download_task1 = Arc::clone(&download_task);
-        // let semaphore = Arc::clone(&semaphore);
-        // let notify_clone = Arc::clone(&notify);
-
-    //     futures.push(async move {
-    //         loop {
-    //             // 获取一个信号量许可
-    //             let _permit = semaphore.acquire().await.unwrap();
-
-    //             if download_task1.is_pause.load(Ordering::Relaxed) {
-    //                 notify_clone.notified().await;
-    //             }
-                
-    //             download_single_segment(segment, client, download_task1, request_data.retry, tx).await;
-    //             break;
-    //         }
-    //     });
-    // }
-    // while let Some(_) = futures.next().await {}
-    
-    // 任务构造器
-    // let create_task = |segment: Segment| {
-    //     let client = Arc::clone(&client);
-    //     let tx = tx.clone();
-    //     let download_task = Arc::clone(&download_task);
-
-    //     async move {
-    //         download_single_segment(segment, client, download_task, request_data.retry, tx).await
-    //     };
-
-    //     // async move {
-    //     //     // let res = timeout(Duration::from_millis(30), download_single_segment(segment, client, download_task, request_data.retry, tx)).await?;
-    //     //     // match res {
-    //     //     //     Ok(r) => r,
-    //     //     //     Err(_) => Err("下载超时".into()),
-    //     //     // }
-    //     //     res
-    //     // }
-    // };
-
-    // 初始填充并发槽位
-    // for _ in 0..request_data.concurrency {
-    //     if let Some(segment) = segments.pop() {
-    //         futures.push(create_task(segment));
-    //         // futures.push(create_task(segment));
-    //     } else {
-    //         break;
-    //     }
-    // }
-
-    // // 动态调度
-    // while let Some(result) = futures.next().await {
-    //     if let Some(segment) = segments.pop() {
-    //         // futures.push(create_task(segment));
-    //     }
-    // }
-
-    // let mut tasks = Vec::with_capacity(segments.len());
-    /*
-    for item in segments {
-        let semaphore = Arc::clone(&semaphore);
-        let client = Arc::clone(&client);
-        let tx = tx.clone();
-        let download_task = Arc::clone(&download_task);
-
-        tasks.push(tokio::spawn(async move {
-            let _permit = semaphore.acquire().await.unwrap();
-
-            if download_task.is_pause.load(Ordering::Relaxed)
-                || download_task.is_cancel.load(Ordering::Relaxed)
-            {
-                return;
-            }
-
-            // 带重试的下载
-            let mut is_finish = false;
-            for attempt in 0..request_data.retry {
-                if let Ok(resp) = client.get(&item.download_url).send().await
-                    && resp.status().is_success()
-                {
-                    let content_length = resp.content_length().unwrap_or(0);
-                    if let Ok(bytes) = resp.bytes().await {
-                        fs::write(item.save_path.join(&item.segment_name), bytes)
-                            .await
-                            .unwrap();
-                        let downloaded_nums = {
-                            let mut downloaded = download_task.downloaded_segments.lock().await;
-                            downloaded.push(item.segment_name.to_string());
-                            downloaded.len()
-                        } as i32;
-                        let _ = tx
-                            .send(ChannelMessage::SegmentDownloaded {
-                                downloaded_nums,
-                                content_length,
-                            })
-                            .await;
-                        is_finish = true;
-                        break;
-                    }
-                }
-
-                // 延迟请求
-                if attempt < request_data.retry - 1 {
-                    sleep(Duration::from_millis(200)).await;
-                }
-            }
-
-            if !is_finish {
-                record_failed_file(&download_task, &item).await;
-            }
-        }));
-    }
-
-    // 等待任务完成
-    for task in tasks {
-        let _ = task.await;
-    }
-    */
-
-    // Ok(())
 }
 
 async fn download_single_segment(
     segment: Segment,
-    client: Arc<Client>,
-    download_task: Arc<Mutex<DownloadTask>>,
+    client: &Arc<Client>,
+    download_task: &Arc<DownloadTask>,
     retry: u32,
     tx: mpsc::Sender<ChannelMessage>,
 ) {
     let mut is_finish = false;
 
     for attempt in 0..retry {
-        if let Ok(resp) = client.get(&segment.download_url).send().await && resp.status().is_success() {
+        if let Ok(resp) = client.get(&segment.download_url).send().await
+            && resp.status().is_success()
+        {
             let content_length = resp.content_length().unwrap_or(0);
-            if let Ok(bytes) = resp.bytes().await && fs::write(segment.save_path.join(&segment.segment_name), bytes).await.is_ok() {
-                let _ = tx.send(ChannelMessage::SegmentDownloaded { content_length }).await;
+            if let Ok(bytes) = resp.bytes().await
+                && fs::write(segment.save_path.join(&segment.segment_name), bytes)
+                    .await
+                    .is_ok()
+            {
+                let downloaded_nums = {
+                    let mut guard = download_task.downloaded_segments.lock().await;
+                    guard.push(segment.segment_name.clone());
+                    guard.len()
+                } as i32;
+                sleep(Duration::from_millis(50)).await;
+                let _ = tx
+                    .send(ChannelMessage::Downloaded {
+                        downloaded_nums,
+                        content_length,
+                    })
+                    .await;
                 is_finish = true;
                 break;
-                // println!("延迟500ms");
-                // sleep(Duration::from_millis(500)).await;
-                // let downloaded_nums = {
-                //     let mut downloaded = download_task.downloaded_segments.lock().await;
-                //     downloaded.push(segment.segment_name.to_string());
-                //     downloaded.len()
-                // } as i32;
-                // let _ = tx
-                //     .send(ChannelMessage::SegmentDownloaded {
-                //         downloaded_nums,
-                //         content_length,
-                //     })
-                //     .await;
-                // is_finish = true;
-                // break;
             }
         }
 
@@ -786,23 +554,17 @@ async fn download_single_segment(
         }
     }
 
-    if !is_finish {
-        record_failed_file(&download_task, &segment).await;
-    }
-}
-
-// 记录下载失败的分片
-async fn record_failed_file(
-    download_task: &Arc<Mutex<DownloadTask>>,
-    segment: &Segment,
-) {
+    // 记录下载失败的分片
+    if !is_finish
+        && let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(segment.save_path.join(FAILED_FILENAME))
+            .await
     {
-        let mut dt = download_task.lock().await;
-        dt.failed_segment_nums += 1;
-    }
-
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(segment.save_path.join(FAILED_FILENAME)).await {
-        let _ = file.write_all(format!("{},{}\n", segment.segment_name, segment.download_url).as_bytes()).await;
+        let _ = file
+            .write_all(format!("{},{}\n", segment.segment_name, segment.download_url).as_bytes())
+            .await;
     }
 }
 
@@ -1010,54 +772,12 @@ async fn create_safe_save_path(
     Some((save_path.into(), clean_name.to_string()))
 }
 
-// 取消或正常结束下载时（含下载失败的文件）重置UI
-async fn reset_download_status(
-    ui_weak: &slint::Weak<AppWindow>,
-    download_task: &Arc<DownloadTask>,
-    message: SharedString,
-    is_cancel_reset: bool,
-) {
-    // 非取消下载时计算失败文件数
-    // let failed_file_nums = if !is_cancel_reset {
-    //     download_task.failed_segments.lock().await.len()
-    // } else {
-    //     0
-    // };
-
-    // 构建最终消息
-    // let final_message = if failed_file_nums > 0 {
-        // format!("有{}个分片无法下载", failed_file_nums,).into()
-    // } else {
-        // message
-    // };
-
-    // download_task.downloaded_segments.lock().await.clear();
-    // download_task.is_new_download.swap(true, Ordering::Relaxed);
-
-    ui_weak
-        .upgrade_in_event_loop(move |ui| {
-            // ui.invoke_show_message(final_message, failed_file_nums > 0);
-            ui.set_enable_start_btn(true);
-            ui.set_enable_pause_btn(false);
-            ui.set_enable_cancel_btn(false);
-            // ui.set_is_downloading(false);
-            ui.set_is_pause(false);
-            // ui.set_has_failed_file(failed_file_nums > 0);
-
-            if is_cancel_reset {
-                ui.set_total_nums(0);
-                ui.set_downloaded_nums(0);
-            }
-        })
-        .unwrap();
-}
-
-// 合并为MP4并删除分片
+// 合并为MP4
 async fn merge_and_delete(
-    args: Vec<String>,
+    args: Vec<&str>,
     is_delete_segment: bool,
-    downloaded_segments: Vec<String>,
-    save_path: Arc<Path>,
+    downloaded_segments: &Vec<String>,
+    save_path: &Arc<Path>,
 ) -> Result<String, io::Error> {
     let mut cmd = Command::new("ffmpeg");
     cmd.args(args);
