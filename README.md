@@ -1,7 +1,7 @@
 # M3U8Downloader
-桌面端 **M3U8** 下载器，开发语言： `Rust`，`0.1.0` 版本使用多线程实现，`0.1.1` 版本后改为异步多线程模型，内存占用大幅降低。
+使用 `Rust` 语言实现的**M3U8**下载工具。
 
-依赖 `Rust` 生态：`slint`、`tokio`、`reqwest`等。
+感谢强大的 `Rust` 生态：`slint`、`tokio`、`futures`、`reqwest`等！
 
 ## 主要功能
 
@@ -20,7 +20,7 @@
 二选一
 
 - 克隆本项目手动构建
-- 下载 `exe` 文件：[m3u8downloader-x86_64-v0.1.0.exe](http://124.71.107.97/res/m3u8downloader-x86_64-v0.1.1.exe)
+- 下载 `exe` 文件：[m3u8downloader-x86_64-v0.1.1.exe](http://124.71.107.97/res/m3u8downloader-x86_64-v0.1.1.exe)
 
 ## 截图
 

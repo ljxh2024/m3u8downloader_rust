@@ -36,22 +36,20 @@ export component AppWindow inherits Window {
     // 输入组（后端只读）
     // out property <string> m3u8-url;
     out property <string> m3u8-url: "http://localhost/res/tmp/index.m3u8";
-    // out property <string> m3u8-url: "https://hn.bfvvs.com/play/lej2mZze/index.m3u8";
     // out property <string> video-name;
     out property <string> video-name: "m3u8test";
     out property <string> concurrency;
     out property <string> retry;
-    out property <string> timeout;
+    out property <string> connect-timeout;
     out property <string> message;
     out property <bool> is-err-msg;
     out property <color> normal-msg-color: Palette.color-scheme == ColorScheme.light ? #323130 : #e6e6e6;
 
     out property <string> github: "https://github.com/ljxh2024/m3u8downloader";
 
-    // 回调函数
     callback select-dir();
     callback open-failed-file();
-    callback start-download(bool);
+    callback start-download();
     callback pause-download();
     callback cancel-download();
     callback parsed-state(string, int);
@@ -66,6 +64,16 @@ export component AppWindow inherits Window {
         enable-cancel-btn = false;
         is-pause = false;
         in-progress = false;
+    }
+
+    // 点击（继续）下载按钮时状态
+    function start-parse() {
+        enable-start-btn = false;
+        in-progress = true;
+        is-pause = false;
+        has-failed-file = false;
+        show-message("正在解析...", false);
+        start-download();
     }
 
     // 格式化消息
@@ -132,10 +140,10 @@ export component AppWindow inherits Window {
                         LineEdit {
                             text <=> root.work-dir;
                             read-only: true;
-                            enabled: !root.in-progress;
+                            enabled: !root.in-progress && !root.is-pause;
                         }
                         Button {
-                            enabled: !root.in-progress;
+                            enabled: !root.in-progress && !root.is-pause;
                             text: "选择";
                             clicked => { root.select-dir(); }
                         }
@@ -155,7 +163,7 @@ export component AppWindow inherits Window {
                         LineEdit {
                             text <=> root.video-name;
                             colspan: 2;
-                            enabled: !root.in-progress;
+                            enabled: !root.in-progress && !root.is-pause;
                         }
                     }
                     // M3U8 URL
@@ -173,7 +181,7 @@ export component AppWindow inherits Window {
                         LineEdit {
                             text <=> root.m3u8-url;
                             colspan: 2;
-                            enabled: !root.in-progress;
+                            enabled: !root.in-progress && !root.is-pause;
                         }
                     }
                     // 并发数
@@ -187,7 +195,7 @@ export component AppWindow inherits Window {
                             text <=> root.concurrency;
                             input-type: number;
                             colspan: 2;
-                            enabled: !root.in-progress;
+                            enabled: !root.in-progress || root.is-pause;
                             placeholder-text: "4";
                         }
                     }
@@ -202,7 +210,7 @@ export component AppWindow inherits Window {
                             text <=> root.retry;
                             input-type: number;
                             colspan: 2;
-                            enabled: !root.in-progress;
+                            enabled: !root.in-progress || root.is-pause;
                             placeholder-text: "3";
                         }
                     }
@@ -214,10 +222,10 @@ export component AppWindow inherits Window {
                             }
                         }
                         LineEdit {
-                            text <=> root.timeout;
+                            text <=> root.connect-timeout;
                             input-type: number;
                             colspan: 2;
-                            enabled: !root.in-progress;
+                            enabled: !root.in-progress || root.is-pause;
                             placeholder-text: "3";
                         }
                     }
@@ -227,7 +235,7 @@ export component AppWindow inherits Window {
                     CheckBox {
                         text: "下载完成后合并为MP4";
                         checked <=> root.is-merge;
-                        enabled: !root.in-progress;
+                        enabled: !root.in-progress || root.is-pause;
                         toggled() => {
                             if !self.checked && root.is-delete-segment {
                                 root.is-delete-segment = false;
@@ -237,7 +245,7 @@ export component AppWindow inherits Window {
                     CheckBox {
                         text: "合并后删除分片";
                         checked <=> root.is-delete-segment;
-                        enabled: root.is-merge && !root.in-progress;
+                        enabled: root.is-merge && (!root.in-progress || root.is-pause);
                     }
                 }
                 // 按钮事件操作
@@ -246,17 +254,17 @@ export component AppWindow inherits Window {
                         text: root.is-pause ? "继续下载" : "下载";
                         enabled: root.enable-start-btn && !root.work-dir.is-empty && !root.video-name.is-empty && !root.m3u8-url.is-empty;
                         primary: true;
-                        clicked => { root.start-download(root.is-pause); }
+                        clicked => { root.start-parse() }
                     }
                     Button {
                         text: "暂停";
                         enabled: root.enable-pause-btn;
-                        clicked => { root.pause-download(); }
+                        clicked => { root.pause-download() }
                     }
                     Button {
                         text: "取消";
                         enabled: root.enable-cancel-btn;
-                        clicked => { root.cancel-download(); }
+                        clicked => { root.cancel-download() }
                     }
                 }
                 HorizontalBox {
@@ -283,7 +291,7 @@ export component AppWindow inherits Window {
                     padding-bottom: 0px;
                     TouchArea {
                         mouse-cursor: pointer;
-                        clicked => { root.open-failed-file(); }
+                        clicked => { root.open-failed-file() }
                         Text {
                             text: "查看下载失败的分片";
                             color: #3399ff;
