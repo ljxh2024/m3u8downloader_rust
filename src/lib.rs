@@ -404,7 +404,7 @@ async fn loop_receive_message(
                 current_content_length += content_length;
                 let downloaded_nums = download_task
                     .downloaded_nums
-                    .fetch_add(1, Ordering::Relaxed);
+                    .fetch_add(1, Ordering::Relaxed) + 1;
 
                 ui_weak
                     .upgrade_in_event_loop(move |ui| {
@@ -415,11 +415,11 @@ async fn loop_receive_message(
             }
             // 暂停
             ChannelMessage::Pause => {
-                download_task.state.store(2, Ordering::Release);
+                download_task.state.store(2, Ordering::Relaxed);
             }
             // 取消
             ChannelMessage::Cancel => {
-                let old_state = download_task.state.swap(0, Ordering::AcqRel);
+                let old_state = download_task.state.swap(0, Ordering::Relaxed);
                 // 暂停时，下载任务已释放，需显式更新UI
                 if old_state == 2 {
                     ui_weak
@@ -523,7 +523,7 @@ async fn start_parse_download(
 
     while futures.next().await.is_some() {
         // 暂停或取消
-        if download_task.state.load(Ordering::Acquire) != 1 {
+        if download_task.state.load(Ordering::Relaxed) != 1 {
             break;
         }
 
