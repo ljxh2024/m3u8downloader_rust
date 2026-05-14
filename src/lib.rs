@@ -341,17 +341,15 @@ async fn loop_receive_message(
                                 })
                                 .unwrap();
 
-                            let m3u8_path = &request_data
+                            let m3u8_path = request_data
                                 .save_path
                                 .join(M3U8_FILENAME)
-                                .to_str()
-                                .unwrap()
+                                .to_string_lossy()
                                 .to_string();
                             let mp4_path = request_data
                                 .save_path
                                 .join(format!("{}.mp4", request_data.video_name))
-                                .to_str()
-                                .unwrap()
+                                .to_string_lossy()
                                 .to_string();
                             // 构建合并参数
                             let args = vec![
@@ -538,6 +536,7 @@ async fn start_parse_download(
                 if download_task.state.load(Ordering::Acquire) != 1 {
                     return;
                 }
+
                 download_single_segment(
                     segment,
                     &client,
@@ -633,15 +632,11 @@ async fn download_single_segment(
 
 /// 格式化大小显示
 fn format_size(size: u64) -> String {
-    if size < 1024 {
-        return format!("{size} B");
-    }
-
-    if size == 1024 {
+    if size <= 1024 {
         return String::from("1 KB");
     }
 
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    const UNITS: [&str; 3] = ["KB", "MB", "GB"];
     let mut size = size as f64;
     let mut unit_index = 0;
 
@@ -664,16 +659,15 @@ async fn fetch_m3u8_content(client: &Client, url: &str) -> Result<String, Box<dy
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let is_valid_mime = content_type == "application/vnd.apple.mpegurl"
-        || content_type == "application/x-mpegURL"
-        || content_type == "audio/mpegurl";
+        .unwrap_or("")
+        .to_lowercase();
+    let text = resp.text().await?;
 
-    if !is_valid_mime {
-        return Err("非 M3U8 格式".into());
+    if !content_type.contains("mpegurl") && !text.contains("#EXTM3U") && !text.contains("#EXTINF") {
+        return Err("非M3U8格式".into());
     }
 
-    Ok(resp.text().await?)
+    Ok(text)
 }
 
 /// 构建绝对URL
@@ -725,7 +719,8 @@ async fn parse_m3u8(
         .filter(|line| !line.starts_with('#'))
         .count();
     let mut segments: Vec<Segment> = Vec::with_capacity(segment_count);
-    let mut index: u32 = 0;
+    let mut key_index = 1u32;
+    let mut segment_index = 0u32;
 
     for line in content.lines() {
         if line.trim().is_empty() {
@@ -740,26 +735,34 @@ async fn parse_m3u8(
                 .and_then(|s| s.split('"').next())
                 .unwrap_or("");
             let download_url = build_abs_url(&base_url, key)?.to_string();
+            let new_key_name = format!("key_{}.key", key_index);
+
             segments.push(Segment {
-                name: "key.key".to_string(),
-                save_path: save_path.clone(),
+                name: new_key_name.clone(),
+                save_path: Arc::clone(save_path),
                 download_url,
             });
+
             writer
-                .write_all(format!("{}\n", line.replace(key, "key.key")).as_bytes())
+                .write_all(format!("{}\n", line.replace(key, &new_key_name)).as_bytes())
                 .await?;
+
+            key_index += 1;
         } else if !line.starts_with("#") {
             let download_url = build_abs_url(&base_url, line)?.to_string();
-            let segment_name = format!("index{}.ts", index);
+            let segment_name = format!("segment_{}.ts", segment_index);
+
             segments.push(Segment {
-                name: segment_name.to_owned(),
-                save_path: save_path.clone(),
+                name: segment_name.clone(),
+                save_path: Arc::clone(save_path),
                 download_url,
             });
+
             writer
                 .write_all(format!("{}\n", segment_name).as_bytes())
                 .await?;
-            index += 1;
+
+            segment_index += 1;
         } else {
             writer.write_all(format!("{}\n", line).as_bytes()).await?;
         }
@@ -805,7 +808,7 @@ fn parse_m3u8_master(content: &str) -> String {
             {
                 best_resolution_sum = resolution_sum;
                 best_bandwidth = bandwidth;
-                best_url = url_line.to_string();
+                best_url = url_line.to_owned();
             }
         }
     }
@@ -814,11 +817,15 @@ fn parse_m3u8_master(content: &str) -> String {
 }
 
 /// 安全的创建保存目录
+///
+/// work_dir是手动选择的工作目录，不需要做校验
 async fn create_safe_save_path(
     work_dir: &SharedString,
     video_name: &SharedString,
 ) -> Result<(Arc<Path>, String), Box<dyn Error>> {
-    if video_name.trim().is_empty() {
+    let video_name = video_name.trim();
+
+    if video_name.is_empty() {
         return Err("视频名称不能为空".into());
     }
 
@@ -843,7 +850,7 @@ async fn create_safe_save_path(
         return Err("无法创建保存目录".into());
     }
 
-    Ok((save_path.into(), clean_name.to_string()))
+    Ok((save_path.into(), clean_name))
 }
 
 /// 合并为MP4、删除分片
