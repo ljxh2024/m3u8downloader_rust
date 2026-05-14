@@ -189,7 +189,10 @@ enum ChannelMessage {
     Pause,
     Cancel,
     ReleaseTask,
-    Downloaded(u64),
+    Downloaded {
+        // 单个分片的大小
+        segment_size: usize,
+    },
 }
 
 /// 下载参数
@@ -247,7 +250,7 @@ async fn loop_receive_message(
     // 初始化任务配置
     let download_task = Arc::new(DownloadTask::new());
     // 当前已下载的文件大小
-    let mut current_content_length = 0u64;
+    let mut current_content_length = 0usize;
     // 下载任务句柄
     let master_task: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 
@@ -414,8 +417,8 @@ async fn loop_receive_message(
                     .unwrap();
             }
             // 某个分片下载完成
-            ChannelMessage::Downloaded(content_length) => {
-                current_content_length += content_length;
+            ChannelMessage::Downloaded { segment_size } => {
+                current_content_length += segment_size;
                 let downloaded_nums = download_task
                     .downloaded_nums
                     .fetch_add(1, Ordering::Relaxed)
@@ -566,18 +569,18 @@ async fn download_single_segment(
         if let Ok(resp) = client.get(&segment.download_url).send().await
             && resp.status().is_success()
         {
-            let content_length = resp.content_length().unwrap_or(0);
-
             // 使用流式写入
             match File::create(segment.save_path.join(&segment.name)).await {
                 Ok(file) => {
                     let mut ok = true;
                     let mut writer = BufWriter::new(file);
                     let mut stream = resp.bytes_stream();
+                    let mut segment_size = 0usize;
 
                     while let Some(item) = stream.next().await {
                         match item {
                             Ok(chunk) => {
+                                segment_size += chunk.len();
                                 if writer.write_all(&chunk).await.is_err() {
                                     ok = false;
                                     break;
@@ -600,7 +603,7 @@ async fn download_single_segment(
                             .await
                             .push(segment.name.clone());
                         // 更新进度
-                        let _ = tx.send(ChannelMessage::Downloaded(content_length)).await;
+                        let _ = tx.send(ChannelMessage::Downloaded { segment_size }).await;
                         is_finish = true;
                         break;
                     }
@@ -631,12 +634,12 @@ async fn download_single_segment(
 }
 
 /// 格式化大小显示
-fn format_size(size: u64) -> String {
+fn format_size(size: usize) -> String {
     if size <= 1024 {
         return String::from("1 KB");
     }
 
-    const UNITS: [&str; 3] = ["KB", "MB", "GB"];
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut size = size as f64;
     let mut unit_index = 0;
 
