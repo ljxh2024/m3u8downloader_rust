@@ -135,12 +135,17 @@ pub fn run() -> Result<(), slint::PlatformError> {
         move || {
             let ui = ui_weak.unwrap();
 
-            let file_path = Path::new(&ui.get_work_dir()).join(ui.get_video_name()).join(FAILED_FILENAME);
+            let file_path = Path::new(&ui.get_work_dir())
+                .join(ui.get_video_name())
+                .join(FAILED_FILENAME);
             if file_path.exists() {
                 #[cfg(windows)]
                 {
                     let path_str = file_path.to_string_lossy();
-                    Command::new("explorer").arg(format!("/select,{}", path_str)).spawn().ok();
+                    Command::new("explorer")
+                        .arg(format!("/select,{}", path_str))
+                        .spawn()
+                        .ok();
                 }
             }
         }
@@ -677,7 +682,10 @@ async fn parse_m3u8(
     }
 
     let mut writer = BufWriter::new(File::create(save_path.join(M3U8_FILENAME)).await?);
-    let segment_count = content.lines().filter(|line| !line.starts_with('#')).count();
+    let segment_count = content
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .count();
     let mut segments: Vec<Segment> = Vec::with_capacity(segment_count);
     let mut index: u32 = 0;
 
