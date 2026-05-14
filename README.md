@@ -1,5 +1,5 @@
 # M3U8Downloader
-使用 `Rust` 语言实现的**M3U8**下载工具。
+使用 `Rust` 语言实现的**M3U8**视频下载器。
 
 感谢强大的 `Rust` 生态：`slint`、`tokio`、`futures`、`reqwest`等！
 

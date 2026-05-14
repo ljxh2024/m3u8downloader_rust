@@ -129,25 +129,20 @@ pub fn run() -> Result<(), slint::PlatformError> {
         }
     });
 
-    // 打开目录
+    // 打开下载失败的文件
     window.on_open_failed_file({
         let ui_weak = window.as_weak();
         move || {
             let ui = ui_weak.unwrap();
 
-            slint::spawn_local(async_compat::Compat::new(async move {
-                Command::new("explorer")
-                    .arg(
-                        Path::new("/select,")
-                            .join(ui.get_work_dir())
-                            .join(ui.get_video_name())
-                            .join(FAILED_FILENAME),
-                    )
-                    .output()
-                    .await
-                    .unwrap();
-            }))
-            .unwrap();
+            let file_path = Path::new(&ui.get_work_dir()).join(ui.get_video_name()).join(FAILED_FILENAME);
+            if file_path.exists() {
+                #[cfg(windows)]
+                {
+                    let path_str = file_path.to_string_lossy();
+                    Command::new("explorer").arg(format!("/select,{}", path_str)).spawn().ok();
+                }
+            }
         }
     });
 
@@ -404,7 +399,8 @@ async fn loop_receive_message(
                 current_content_length += content_length;
                 let downloaded_nums = download_task
                     .downloaded_nums
-                    .fetch_add(1, Ordering::Relaxed) + 1;
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
 
                 ui_weak
                     .upgrade_in_event_loop(move |ui| {
@@ -415,11 +411,11 @@ async fn loop_receive_message(
             }
             // 暂停
             ChannelMessage::Pause => {
-                download_task.state.store(2, Ordering::Relaxed);
+                download_task.state.store(2, Ordering::Release);
             }
             // 取消
             ChannelMessage::Cancel => {
-                let old_state = download_task.state.swap(0, Ordering::Relaxed);
+                let old_state = download_task.state.swap(0, Ordering::AcqRel);
                 // 暂停时，下载任务已释放，需显式更新UI
                 if old_state == 2 {
                     ui_weak
@@ -509,21 +505,22 @@ async fn start_parse_download(
     let mut futures = FuturesUnordered::new();
 
     // 初始化并发数
-    for _ in 0..request_data.concurrency.min(wait_download_segments.len()) {
-        if let Some(segment) = wait_download_segments.pop() {
-            futures.push(download_single_segment(
-                segment,
-                &client,
-                download_task,
-                request_data.retry,
-                tx.clone(),
-            ));
-        }
+    let initial_count = request_data.concurrency.min(wait_download_segments.len());
+    for _ in 0..initial_count {
+        // 已确保有足够元素
+        let segment = wait_download_segments.pop().unwrap();
+        futures.push(download_single_segment(
+            segment,
+            &client,
+            download_task,
+            request_data.retry,
+            tx.clone(),
+        ));
     }
 
     while futures.next().await.is_some() {
         // 暂停或取消
-        if download_task.state.load(Ordering::Relaxed) != 1 {
+        if download_task.state.load(Ordering::Acquire) != 1 {
             break;
         }
 
@@ -561,12 +558,6 @@ async fn download_single_segment(
                     .await
                     .is_ok()
             {
-                // let downloaded_nums = {
-                //     // 记录已下载的分片
-                //     let mut guard = download_task.downloaded_segments.lock().await;
-                //     guard.push(segment.name.clone());
-                //     guard.len()
-                // } as i32;
                 download_task
                     .downloaded_segments
                     .lock()
@@ -686,8 +677,9 @@ async fn parse_m3u8(
     }
 
     let mut writer = BufWriter::new(File::create(save_path.join(M3U8_FILENAME)).await?);
-    let mut segments: Vec<Segment> = Vec::with_capacity(content.lines().count() / 3);
-    let mut index = 0;
+    let segment_count = content.lines().filter(|line| !line.starts_with('#')).count();
+    let mut segments: Vec<Segment> = Vec::with_capacity(segment_count);
+    let mut index: u32 = 0;
 
     for line in content.lines() {
         if line.trim().is_empty() {
