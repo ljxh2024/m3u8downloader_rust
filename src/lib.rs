@@ -7,7 +7,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
     },
 };
 use tokio::{
@@ -173,10 +173,7 @@ enum ChannelMessage {
     Pause,
     Cancel,
     ReleaseTask,
-    Downloaded {
-        downloaded_nums: i32, // 已下载分片数，直接在UI界面显示
-        content_length: u64,
-    },
+    Downloaded(u64),
 }
 
 /// 下载参数
@@ -194,7 +191,7 @@ struct RequestData {
 /// 分片信息
 #[derive(Clone)]
 struct Segment {
-    segment_name: String,
+    name: String,
     save_path: Arc<Path>,
     download_url: String,
 }
@@ -205,6 +202,8 @@ struct DownloadTask {
     segments: Mutex<Vec<Segment>>,
     // 已下载的分片，存储分片名，用以删除分片
     downloaded_segments: Mutex<Vec<String>>,
+    // 已下载分片数
+    downloaded_nums: AtomicU32,
     // 0未下载或取消下载，1下载中，2暂停
     state: AtomicU8,
     // 是否大师列表
@@ -216,6 +215,7 @@ impl DownloadTask {
         Self {
             segments: Mutex::new(Vec::new()),
             downloaded_segments: Mutex::new(Vec::new()),
+            downloaded_nums: AtomicU32::new(0),
             state: AtomicU8::new(0),
             is_master_playlist: AtomicBool::new(false),
         }
@@ -245,6 +245,9 @@ async fn loop_receive_message(
 
                 if download_task_clone.state.load(Ordering::Relaxed) == 0 {
                     download_task_clone.downloaded_segments.lock().await.clear();
+                    download_task_clone
+                        .downloaded_nums
+                        .store(0, Ordering::Relaxed);
                     current_content_length = 0;
                 }
 
@@ -397,26 +400,26 @@ async fn loop_receive_message(
                     .unwrap();
             }
             // 某个分片下载完成
-            ChannelMessage::Downloaded {
-                downloaded_nums,
-                content_length,
-            } => {
+            ChannelMessage::Downloaded(content_length) => {
                 current_content_length += content_length;
+                let downloaded_nums = download_task
+                    .downloaded_nums
+                    .fetch_add(1, Ordering::Relaxed);
 
                 ui_weak
                     .upgrade_in_event_loop(move |ui| {
-                        ui.set_downloaded_nums(downloaded_nums);
+                        ui.set_downloaded_nums(downloaded_nums as i32);
                         ui.set_content_length(format_size(current_content_length).into());
                     })
                     .unwrap();
             }
             // 暂停
             ChannelMessage::Pause => {
-                download_task.state.store(2, Ordering::Relaxed);
+                download_task.state.store(2, Ordering::Release);
             }
             // 取消
             ChannelMessage::Cancel => {
-                let old_state = download_task.state.swap(0, Ordering::SeqCst);
+                let old_state = download_task.state.swap(0, Ordering::AcqRel);
                 // 暂停时，下载任务已释放，需显式更新UI
                 if old_state == 2 {
                     ui_weak
@@ -460,7 +463,7 @@ async fn start_parse_download(
             (
                 segments
                     .iter()
-                    .filter(|&item| !downloaded_segments.contains(&item.segment_name))
+                    .filter(|&item| !downloaded_segments.contains(&item.name))
                     .cloned()
                     .collect(),
                 segments.len(),
@@ -518,15 +521,13 @@ async fn start_parse_download(
         }
     }
 
-    while let Some(res) = futures.next().await {
+    while futures.next().await.is_some() {
         // 暂停或取消
-        if download_task.state.load(Ordering::Relaxed) != 1 {
+        if download_task.state.load(Ordering::Acquire) != 1 {
             break;
         }
 
-        if res.is_ok()
-            && let Some(segment) = wait_download_segments.pop()
-        {
+        if let Some(segment) = wait_download_segments.pop() {
             futures.push(download_single_segment(
                 segment,
                 &client,
@@ -547,7 +548,7 @@ async fn download_single_segment(
     download_task: &Arc<DownloadTask>,
     retry: u32,
     tx: mpsc::Sender<ChannelMessage>,
-) -> Result<(), Box<dyn Error>> {
+) {
     let mut is_finish = false;
 
     for attempt in 0..retry {
@@ -556,22 +557,22 @@ async fn download_single_segment(
         {
             let content_length = resp.content_length().unwrap_or(0);
             if let Ok(bytes) = resp.bytes().await
-                && fs::write(segment.save_path.join(&segment.segment_name), bytes)
+                && fs::write(segment.save_path.join(&segment.name), bytes)
                     .await
                     .is_ok()
             {
-                let downloaded_nums = {
-                    // 记录已下载的分片
-                    let mut guard = download_task.downloaded_segments.lock().await;
-                    guard.push(segment.segment_name.clone());
-                    guard.len()
-                } as i32;
-                let _ = tx
-                    .send(ChannelMessage::Downloaded {
-                        downloaded_nums,
-                        content_length,
-                    })
-                    .await;
+                // let downloaded_nums = {
+                //     // 记录已下载的分片
+                //     let mut guard = download_task.downloaded_segments.lock().await;
+                //     guard.push(segment.name.clone());
+                //     guard.len()
+                // } as i32;
+                download_task
+                    .downloaded_segments
+                    .lock()
+                    .await
+                    .push(segment.name.clone());
+                let _ = tx.send(ChannelMessage::Downloaded(content_length)).await;
                 is_finish = true;
                 break;
             }
@@ -591,11 +592,9 @@ async fn download_single_segment(
             .await
     {
         let _ = file
-            .write_all(format!("{},{}\n", segment.segment_name, segment.download_url).as_bytes())
+            .write_all(format!("{},{}\n", segment.name, segment.download_url).as_bytes())
             .await;
     }
-
-    Ok(())
 }
 
 /// 格式化大小显示
@@ -704,7 +703,7 @@ async fn parse_m3u8(
                 .unwrap_or("");
             let download_url = build_abs_url(&base_url, key)?.to_string();
             segments.push(Segment {
-                segment_name: "key.key".to_string(),
+                name: "key.key".to_string(),
                 save_path: save_path.clone(),
                 download_url,
             });
@@ -715,7 +714,7 @@ async fn parse_m3u8(
             let download_url = build_abs_url(&base_url, line)?.to_string();
             let segment_name = format!("index{}.ts", index);
             segments.push(Segment {
-                segment_name: segment_name.to_owned(),
+                name: segment_name.to_owned(),
                 save_path: save_path.clone(),
                 download_url,
             });
@@ -832,10 +831,10 @@ async fn merge_and_delete(
         let _ = fs::remove_file(save_path.join(M3U8_FILENAME)).await;
 
         // 删除分片（含key，若有）
-        for segment_name in downloaded_segments {
-            let segment_filepath = save_path.join(segment_name);
-            if segment_filepath.is_file() {
-                tasks.push(async move { fs::remove_file(&segment_filepath).await.ok() });
+        for item in downloaded_segments {
+            let filepath = save_path.join(item);
+            if filepath.is_file() {
+                tasks.push(async move { fs::remove_file(&filepath).await.ok() });
                 if tasks.len() >= 20 && tasks.next().await.is_some() {
                     deleted += 1;
                 }
