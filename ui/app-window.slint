@@ -7,195 +7,160 @@ import {
     CheckBox,
     Palette
 } from "std-widgets.slint";
+import { InputTxt } from "input-txt.slint";
 
 export component AppWindow inherits Window {
     title: "M3U8Downloader";
-    width: 350px;
+    width: 380px;
     height: 470px;
-    
+
+    // 用户输入部分
+    in-out property <string> work-dir: "F:\\temp";
+    out property <string> m3u8-url: "http://localhost/res/tmp/index.m3u8";
+    out property <string> video-name: "m3u8test";
+    out property <string> concurrency;
+    out property <string> retry;
+    out property <string> connect-timeout;
+    in-out property <bool> is-merge: false;
+    in-out property <bool> is-delete-segment: false;
+
     // 按钮组
     in-out property <bool> enable-start-btn: true;
     in-out property <bool> enable-pause-btn: false;
     in-out property <bool> enable-cancel-btn: false;
 
-    // 状态组
-    in-out property <bool> in-progress: false;
-    in-out property <bool> is-pause: false;
-    in-out property <bool> has-failed-file: false;
+    // 下载状态：0待启动下载/已取消 1下载中 2暂停
+    in-out property <int> download-state: 0;
+    // 是否有下载失败的分片
+    in-out property <bool> have-failed-segment: false;
 
-    in-out property <bool> is-merge: false;
-    in-out property <bool> is-delete-segment: false;
+    // 总分片数
+    in-out property <int> total_segment_nums;
+    // 已下载分片数
+    in-out property <int> downloaded_segment_nums;
+    // 已下载分片大小(如：88.88 MB)
+    in-out property <string> downloaded_segment_sizes;
 
-    // 输入组（后端可读可写）
-    // in-out property <string> work-dir;
-    in-out property <string> work-dir: "F:\\temp";
-    in-out property <int> total_nums;
-    in-out property <int> downloaded_nums;
-    in-out property <string> content-length;
-
-    // 输入组（后端只读）
-    // out property <string> m3u8-url;
-    out property <string> m3u8-url: "http://localhost/res/tmp/index.m3u8";
-    // out property <string> video-name;
-    out property <string> video-name: "m3u8test";
-    out property <string> concurrency;
-    out property <string> retry;
-    out property <string> connect-timeout;
+    // 消息文本
     out property <string> message;
+    // 消息文本是否为错误类型
     out property <bool> is-err-msg;
+    // 主题切换时，非错误类型的消息文本颜色
     out property <color> normal-msg-color: Palette.color-scheme == ColorScheme.light ? #323130 : #e6e6e6;
-
+    // 项目地址
     out property <string> github: "https://github.com/ljxh2024/m3u8downloader";
 
+    // 选择工作目录
     callback select-dir();
+    // 打开下载失败的文件
     callback open-failed-file();
+    // 启动下载
     callback start-download();
+    // 暂停下载
     callback pause-download();
+    // 取消下载
     callback cancel-download();
-    callback parsed-state(string, int);
-    callback paused-state();
-    callback canceled-state();
-    callback downloaded-state(string, bool);
+
+    // 任务下载中的界面状态
+    // callback task-downloading();
+    // 任务成功暂停后的界面状态
+    // callback task-paused();
+    // 任务取消成功后的界面状态
+    // callback task-canceled();
+    // 任务结束后的状态，arg_0:消息文本 arg_1:是否是取消导致的任务结束
+    callback task-finished(string, bool);
+
+    // 显示消息文本，arg_0:消息文本,arg_1:消息文本是否为错误类型
     callback show-message(string, bool);
 
-    function init-state() {
-        enable-start-btn = true;
-        enable-pause-btn = false;
-        enable-cancel-btn = false;
-        is-pause = false;
-        in-progress = false;
-    }
-
-    // 点击（继续）下载按钮时状态
+    // 下载中的界面状态(点击下载或继续下载按钮时先触发)
     function start-parse() {
         enable-start-btn = false;
-        in-progress = true;
-        is-pause = false;
-        has-failed-file = false;
-        show-message("正在解析...", false);
+        enable-pause-btn = false;
+        enable-cancel-btn = false;
+
+        download-state = 1;
+        have-failed-segment = false;
+
+        show-message("Parsing...", false);
         start-download();
     }
 
-    // 格式化消息
     show-message(msg, err) => {
         message = msg;
         is-err-msg = err;
     }
 
-    // 已取消
-    canceled-state() => {
-        init-state();
-        has-failed-file = false;
-        total_nums = 0;
-        downloaded_nums = 0;
-        content-length = "";
-        show-message("你已取消下载", false);
-    }
-
-    // 解析完毕
-    parsed-state(a, b) => {
-        enable-pause-btn = true;
-        enable-cancel-btn = true;
-        show-message(a, false);
-        total_nums = b;
-    }
-
-    // 已暂停
-    paused-state() => {
+    task-finished(message, is-cancel) => {
         enable-start-btn = true;
-        enable-cancel-btn = true;
-        is-pause = true;
-        show-message("你已暂停下载", false);
-    }
+        enable-pause-btn = false;
+        enable-cancel-btn = false;
 
-    // 下载完毕
-    downloaded-state(a, b) => {
-        init-state();
-        show-message(a, false);
-        has-failed-file = b;
+        download-state = 0;
+
+        if is-cancel {
+            have-failed-segment = false;
+            total_segment_nums = 0;
+            downloaded_segment_nums = 0;
+            downloaded_segment_sizes = "";
+        }
+
+        show-message(message, false);
     }
 
     // 总布局
     TabWidget {
         // 首页
         Tab {
-            title: "主页";
+            title: @tr("Home");
             VerticalBox {
                 // 输入组件，3列
                 GridLayout {
                     spacing: 6px;
                     // 工作目录
                     Row {
-                        Rectangle {
-                            width: 90px;
-                            Text {
-                                text: "下载目录";
-                            }
-                            Text {
-                                x: 74px;
-                                text: "*";
-                                color: red;
-                            }
-                        }
+                        InputTxt { name: @tr("Download directory"); }
                         LineEdit {
                             text <=> root.work-dir;
                             read-only: true;
-                            enabled: !root.in-progress && !root.is-pause;
+                            enabled: root.download-state == 0;
                         }
                         Button {
-                            enabled: !root.in-progress && !root.is-pause;
-                            text: "选择";
+                            enabled: root.download-state == 0;
+                            text: @tr("Change");
                             clicked => { root.select-dir(); }
                         }
                     }
                     // 视频名称
                     Row {
-                        Rectangle {
-                            Text {
-                                text: "视频名称";
-                            }
-                            Text {
-                                x: 74px;
-                                text: "*";
-                                color: red;
-                            }
-                        }
+                        InputTxt { name: @tr("Video name"); }
                         LineEdit {
                             text <=> root.video-name;
                             colspan: 2;
-                            enabled: !root.in-progress && !root.is-pause;
+                            enabled: root.download-state == 0;
                         }
                     }
                     // M3U8 URL
                     Row {
-                        Rectangle {
-                            Text {
-                                text: "M3U8地址";
-                            }
-                            Text {
-                                x: 76px;
-                                text: "*";
-                                color: red;
-                            }
-                        }
+                        InputTxt { name: @tr("M3U8 URL"); }
                         LineEdit {
                             text <=> root.m3u8-url;
                             colspan: 2;
-                            enabled: !root.in-progress && !root.is-pause;
+                            enabled: root.download-state == 0;
                         }
                     }
                     // 并发数
                     Row {
                         Rectangle {
                             Text {
-                                text: "并发数";
+                                text: @tr("Concurrency");
                             }
                         }
                         LineEdit {
                             text <=> root.concurrency;
                             input-type: number;
                             colspan: 2;
-                            enabled: !root.in-progress || root.is-pause;
+                            enabled: root.download-state != 1;
                             placeholder-text: "4";
                         }
                     }
@@ -203,14 +168,14 @@ export component AppWindow inherits Window {
                     Row {
                         Rectangle {
                             Text {
-                                text: "重试次数";
+                                text: @tr("Retry");
                             }
                         }
                         LineEdit {
                             text <=> root.retry;
                             input-type: number;
                             colspan: 2;
-                            enabled: !root.in-progress || root.is-pause;
+                            enabled: root.download-state != 1;
                             placeholder-text: "3";
                         }
                     }
@@ -218,24 +183,24 @@ export component AppWindow inherits Window {
                     Row {
                         Rectangle {
                             Text {
-                                text: "连接超时(秒)";
+                                text: @tr("Connect timeout(s)");
                             }
                         }
                         LineEdit {
                             text <=> root.connect-timeout;
                             input-type: number;
                             colspan: 2;
-                            enabled: !root.in-progress || root.is-pause;
+                            enabled: root.download-state != 1;
                             placeholder-text: "3";
                         }
                     }
                 }
-                // 转换MP4选项
+                // 合并分片选项
                 VerticalBox {
                     CheckBox {
-                        text: "下载完成后合并为MP4";
+                        text: @tr("Merge to MP4 after all segments downloaded");
                         checked <=> root.is-merge;
-                        enabled: !root.in-progress || root.is-pause;
+                        enabled: root.download-state != 1;
                         toggled() => {
                             if !self.checked && root.is-delete-segment {
                                 root.is-delete-segment = false;
@@ -243,39 +208,41 @@ export component AppWindow inherits Window {
                         }
                     }
                     CheckBox {
-                        text: "合并后删除分片";
+                        text: @tr("Remove all segments after merging");
                         checked <=> root.is-delete-segment;
-                        enabled: root.is-merge && (!root.in-progress || root.is-pause);
+                        enabled: root.is-merge && root.download-state != 1;
                     }
                 }
                 // 按钮事件操作
                 HorizontalBox {
                     Button {
-                        text: root.is-pause ? "继续下载" : "下载";
+                        text: root.download-state == 2 ? @tr("Continue") : @tr("Download");
                         enabled: root.enable-start-btn && !root.work-dir.is-empty && !root.video-name.is-empty && !root.m3u8-url.is-empty;
                         primary: true;
                         clicked => { root.start-parse() }
                     }
                     Button {
-                        text: "暂停";
+                        text: @tr("Pause");
                         enabled: root.enable-pause-btn;
                         clicked => { root.pause-download() }
                     }
                     Button {
-                        text: "取消";
+                        text: @tr("Cancel");
                         enabled: root.enable-cancel-btn;
                         clicked => { root.cancel-download() }
                     }
                 }
+                // 下载进度
                 HorizontalBox {
                     padding-bottom: 0px;
                     Text {
-                        text: "下载进度 " + (root.total_nums > 0 ? root.downloaded_nums + " / " + root.total_nums : "");
+                        text: @tr("Progress") + (root.total_segment_nums > 0 ? root.downloaded_segment_nums + " / " + root.total_segment_nums : "");
                     }
                     Text {
-                        text: root.total_nums > 0 ? root.content-length : "";
+                        text: root.total_segment_nums > 0 ? root.downloaded_segment_sizes : "";
                     }
                 }
+                // 消息文本
                 HorizontalBox {
                     padding-top: 0px;
                     padding-bottom: 0px;
@@ -286,14 +253,15 @@ export component AppWindow inherits Window {
                         horizontal-alignment: center;
                     }
                 }
-                if root.has-failed-file : HorizontalBox {
+                // 显示“查看”下载失败的分片
+                if root.have-failed-segment : HorizontalBox {
                     padding-top: 0px;
                     padding-bottom: 0px;
                     TouchArea {
                         mouse-cursor: pointer;
                         clicked => { root.open-failed-file() }
                         Text {
-                            text: "查看下载失败的分片";
+                            text: @tr("View");
                             color: #3399ff;
                         }
                     }
@@ -302,7 +270,7 @@ export component AppWindow inherits Window {
         }
         // 关于页
         Tab {
-            title: "关于";
+            title: @tr("About");
             Rectangle {
                 Text {
                     y: 140px;

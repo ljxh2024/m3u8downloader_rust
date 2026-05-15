@@ -1,0 +1,98 @@
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: PACKAGE VERSION\n"
+"POT-Creation-Date: 2026-05-15 08:00+0000\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: LANGUAGE <LL@li.org>\n"
+"Language: \n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+#: app-window.slint:115
+msgctxt "AppWindow"
+msgid "Home"
+msgstr "主页"
+
+#: app-window.slint:122
+msgctxt "AppWindow"
+msgid "Download directory"
+msgstr "下载目录"
+
+#: app-window.slint:130
+msgctxt "AppWindow"
+msgid "Change"
+msgstr "选择"
+
+#: app-window.slint:136
+msgctxt "AppWindow"
+msgid "Video name"
+msgstr "视频名称"
+
+#: app-window.slint:145
+msgctxt "AppWindow"
+msgid "M3U8 URL"
+msgstr "M3U8地址"
+
+#: app-window.slint:156
+msgctxt "AppWindow"
+msgid "Concurrency"
+msgstr "并发数"
+
+#: app-window.slint:171
+msgctxt "AppWindow"
+msgid "Retry"
+msgstr "重试次数"
+
+#: app-window.slint:186
+msgctxt "AppWindow"
+msgid "Connect timeout(s)"
+msgstr "连接超时(秒)"
+
+#: app-window.slint:201
+msgctxt "AppWindow"
+msgid "Merge to MP4 after all segments downloaded"
+msgstr "下载完成后合并为MP4"
+
+#: app-window.slint:211
+msgctxt "AppWindow"
+msgid "Remove all segments after merging"
+msgstr "合并后删除分片"
+
+#: app-window.slint:219
+msgctxt "AppWindow"
+msgid "Continue"
+msgstr "继续下载"
+
+#: app-window.slint:219
+msgctxt "AppWindow"
+msgid "Download"
+msgstr "下载"
+
+#: app-window.slint:225
+msgctxt "AppWindow"
+msgid "Pause"
+msgstr "暂停"
+
+#: app-window.slint:230
+msgctxt "AppWindow"
+msgid "Cancel"
+msgstr "取消"
+
+#: app-window.slint:239
+msgctxt "AppWindow"
+msgid "Progress"
+msgstr "下载进度"
+
+#: app-window.slint:264
+msgctxt "AppWindow"
+msgid "View"
+msgstr "查看"
+
+#: app-window.slint:273
+msgctxt "AppWindow"
+msgid "About"
+msgstr "关于"

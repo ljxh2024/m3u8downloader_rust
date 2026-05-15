@@ -1,0 +1,15 @@
+export component InputTxt inherits GridLayout {
+    in-out property <string> name;
+
+    spacing-horizontal: 2px;
+    Text {
+        text: root.name;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+    }
+    Text {
+        text: "*";
+        color: red;
+        vertical-alignment: center;
+    }
+}

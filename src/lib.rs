@@ -1,4 +1,168 @@
-use futures::StreamExt;
+pub mod downloader;
+
+use downloader::{ChannelMessage, DownloadManager, DownloadTask};
+use std::{
+    error::Error,
+    sync::{Arc, atomic::Ordering},
+};
+use tokio::{
+    process::Command,
+    sync::mpsc,
+};
+
+// 下载失败的文件名
+const FAILED_FILENAME: &str = "failed.txt";
+
+slint::include_modules!();
+
+/// 应用入口
+pub fn run() -> Result<(), slint::PlatformError> {
+    let window = AppWindow::new()?;
+
+    // UI界面默认语言，注释掉则自动根据系统区域设置，当前支持：中文/英文
+    let _ = slint::select_bundled_translation("en");
+    // 初始化信道
+    let (tx, mut rx) = mpsc::channel(20);
+    // 下载任务
+    let download_task = Arc::new(DownloadTask::default());
+
+    // 启动异步任务处理信道消息并维护UI
+    let ui_weak_clone_for_channel = window.as_weak();
+    let download_task_clone = Arc::clone(&download_task);
+    slint::spawn_local(async move {
+        consume_channel_message(ui_weak_clone_for_channel, download_task_clone, &mut rx).await;
+    })
+    .unwrap();
+
+    // 启动下载
+    window.on_start_download({
+        let ui_weak = window.as_weak();
+        let download_task_clone = Arc::clone(&download_task);
+        let tx_clone = tx.clone();
+
+        move || {
+            let ui = ui_weak.unwrap();
+            let ui_weak_clone = ui_weak.clone();
+            let download_task_clone = Arc::clone(&download_task_clone);
+            let tx_clone = tx_clone.clone();
+
+            slint::spawn_local(async_compat::Compat::new(async move {
+                // 下载状态
+                let download_state = download_task_clone.state.load(Ordering::Relaxed);
+
+                // 处理下载期间的错误
+                if let Err(e) = parse_download(&ui, download_task_clone, tx_clone).await {
+                    let err_msg = e.to_string();
+                    ui_weak_clone
+                        .upgrade_in_event_loop(move |ui| {
+                            ui.invoke_show_message(err_msg.into(), true);
+                            ui.set_enable_start_btn(true);
+                            ui.set_download_state(download_state as i32);
+                        })
+                        .unwrap();
+                }
+            }))
+            .unwrap();
+        }
+    });
+
+    // 暂停
+    window.on_pause_download({
+        let ui_weak = window.as_weak();
+        let tx_clone = tx.clone();
+
+        move || {
+            let ui = ui_weak.unwrap();
+
+            ui.set_enable_pause_btn(false);
+            ui.invoke_show_message("正在暂停".into(), false);
+
+            let tx_clone = tx_clone.clone();
+            slint::spawn_local(async move {
+                if tx_clone.send(ChannelMessage::Pause).await.is_err() {
+                    ui.set_enable_start_btn(true);
+                    ui.invoke_show_message("暂停失败".into(), true);
+                }
+            })
+            .unwrap();
+        }
+    });
+
+    // 选择目录
+    window.on_select_dir({
+        let ui_weak = window.as_weak();
+        move || {
+            ui_weak.upgrade().unwrap().set_work_dir(
+                rfd::FileDialog::new()
+                    .pick_folder()
+                    .map(|path| path.to_string_lossy().to_string().into())
+                    .unwrap_or_default(),
+            );
+        }
+    });
+
+    // 打开下载失败的文件
+    window.on_open_failed_file({
+        let download_task_clone = Arc::clone(&download_task);
+        move || {
+            let download_task_clone = Arc::clone(&download_task_clone);
+            slint::spawn_local(async move {
+                let file_path = download_task_clone.save_path.join(FAILED_FILENAME);
+                if file_path.is_file() {
+                    Command::new("explorer")
+                        .arg(format!("/select,{}", file_path.to_string_lossy()))
+                        .spawn()
+                        .unwrap()
+                        .wait()
+                        .await
+                        .unwrap();
+                }
+            })
+            .unwrap();
+        }
+    });
+
+    window.run()
+}
+
+/// 处理信道消息并维护UI
+async fn consume_channel_message(
+    ui_weak: slint::Weak<AppWindow>,
+    download_task: Arc<DownloadTask>,
+    rx: &mut mpsc::Receiver<ChannelMessage>,
+) {
+    while let Some(item) = rx.recv().await {
+        match item {
+            ChannelMessage::Pause => {
+                download_task.state.store(2, Ordering::Release);
+            }
+            ChannelMessage::Cancel => {
+                let old_state = download_task.state.swap(0, Ordering::AcqRel);
+                // 暂停时,需显式更新UI
+                if old_state == 2 {
+                    ui_weak.upgrade_in_event_loop(move |ui| {
+                        ui.invoke_task_finished("You canceled the download.".into(), false);
+                    })
+                    .unwrap();
+                }
+            }
+        }
+    }
+}
+
+/// 解析、下载
+async fn parse_download(
+    ui: &AppWindow,
+    download_task: Arc<DownloadTask>,
+    tx: mpsc::Sender<ChannelMessage>,
+) -> Result<(), Box<dyn Error>> {
+    DownloadManager::new(ui, download_task.state.load(Ordering::Relaxed))
+        .await?
+        .download(download_task, tx)
+        .await
+}
+
+/*use futures::StreamExt;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::Client;
@@ -906,3 +1070,4 @@ async fn merge_and_delete(
 
     Ok(msg)
 }
+*/
