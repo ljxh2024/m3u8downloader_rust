@@ -21,7 +21,7 @@
 二选一
 
 - 克隆本项目手动构建
-- 下载 `exe` 文件：[m3u8downloader-x86_64-v0.1.1.exe](http://124.71.107.97/res/m3u8downloader-x86_64-v0.1.1.exe)
+- 下载 `exe` 文件：[m3u8downloader-x86_64-v0.1.2.exe](http://124.71.107.97/res/m3u8downloader-x86_64-v0.1.2.exe)
 
 ## 截图
 
