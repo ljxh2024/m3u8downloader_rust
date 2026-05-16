@@ -409,7 +409,7 @@ impl DownloadManager {
         let failed_nums = failed_segments.len() as u32;
 
         if failed_nums > 0 {
-            final_msg = format!("{} failed to download.", format_complex(failed_nums));
+            final_msg = format!("{} failed to download.", failed_nums);
             // 记录下载失败的分片
             if let Ok(mut file) = fs::File::create(save_path.join(FAILED_FILENAME)).await {
                 let mut failed_str = String::default();
@@ -555,7 +555,7 @@ async fn extra_suffix_from_m3u8_content(
     for line in content.lines() {
         if !line.starts_with("#") {
             let download_url = build_abs_url(base_url, line)?.to_string();
-            let resp = client.get(download_url).send().await?;
+            let resp = client.head(download_url).send().await?;
             if resp.status().is_success()
                 && let Some(v) = resp
                     .headers()
@@ -673,7 +673,7 @@ async fn download_single_segment(
         }
 
         if attempt < retry - 1 {
-            let delay = 200 * 2u64.pow(retry - 1); // 使用指数退避策略
+            let delay = 200 * 2u64.pow(attempt); // 使用指数退避策略
             sleep(Duration::from_millis(delay)).await;
         }
     }
@@ -727,16 +727,14 @@ async fn merge_and_delete(
                 }
             })
             .await;
+
+        let deleted = deleted_counter.load(Ordering::Relaxed);
         msg.push_str(&format!(
-            " and {} have been deleted.",
-            format_complex(deleted_counter.load(Ordering::Relaxed))
+            " and {} segment{} have been deleted.",
+            deleted,
+            if deleted > 1 { "s" } else { "" }
         ));
     }
 
     Ok(msg)
-}
-
-/// 格式化单/多分片英文复数
-fn format_complex(n: u32) -> String {
-    format!("{} segment{}", n, if n > 1 { "s" } else { "" })
 }
