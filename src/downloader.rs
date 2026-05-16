@@ -52,6 +52,13 @@ pub enum ChannelMessage {
     Merging,
 }
 
+/// 下载状态
+pub enum DownloadState {
+    Idle = 0,
+    Downloading = 1,
+    Paused = 2,
+}
+
 /// 分片信息
 #[derive(Debug, Clone)]
 pub struct Segment {
@@ -76,7 +83,7 @@ pub struct DownloadTask {
 impl DownloadTask {
     pub fn clear(&self) {
         self.total_nums.set(0);
-        self.state.set(0);
+        self.state.set(DownloadState::Idle as u8);
 
         self.wait_download_segments.take();
         self.downloaded_segments.take();
@@ -105,7 +112,7 @@ impl DownloadManager {
     /// 若是新下载任务，必须对M3U8地址、并发数和连接超时做验证
     pub async fn new(ui: &AppWindow, download_state: u8) -> Result<Self, String> {
         let video_name = ui.get_video_name();
-        let (save_path, video_name, m3u8_url) = if download_state == 0 {
+        let (save_path, video_name, m3u8_url) = if download_state == DownloadState::Idle as u8 {
             let (save_path, video_name) =
                 create_safe_save_path(&ui.get_work_dir(), &video_name).await?;
             let m3u8_url = ui.get_m3u8_url().to_string();
@@ -142,7 +149,7 @@ impl DownloadManager {
     }
 
     /// 装载下载任务：解析M3U8，将需要的内容更新至 DownloadTask
-    pub async fn load_task(
+    pub async fn load_new_task(
         &self,
         download_task: Rc<DownloadTask>,
         client: Rc<Client>,
@@ -273,7 +280,7 @@ impl DownloadManager {
         })
         .await?;
 
-        download_task.state.set(1);
+        download_task.state.set(DownloadState::Downloading as u8);
 
         let segments = download_task.wait_download_segments.borrow().clone();
         let concurrency = self.concurrency.min(segments.len()); // 并发数
@@ -291,7 +298,7 @@ impl DownloadManager {
                 let tx_clone_for_download = tx_clone_for_download.clone();
 
                 async move {
-                    if download_task_clone.state.get() != 1 {
+                    if download_task_clone.state.get() != DownloadState::Downloading as u8 {
                         return;
                     }
                     download_single_segment(
@@ -309,7 +316,7 @@ impl DownloadManager {
 
         // 并发下载结束
 
-        if download_task.state.get() == 2 {
+        if download_task.state.get() == DownloadState::Paused as u8 {
             let downloaded_segments = download_task.downloaded_segments.borrow().clone();
             // 过滤已下载的分片，重新赋值
             let new = download_task
@@ -326,7 +333,7 @@ impl DownloadManager {
             return Ok(());
         }
 
-        if download_task.state.get() == 0 {
+        if download_task.state.get() == DownloadState::Idle as u8 {
             let _ = tx.send(ChannelMessage::Canceled).await;
             // 重置 download_task
             download_task.clear();
@@ -334,7 +341,7 @@ impl DownloadManager {
         }
 
         // 任务正常结束，重置下载状态
-        download_task.state.set(0);
+        download_task.state.set(DownloadState::Idle as u8);
 
         // 构建最终消息
         let mut final_msg = String::from("Successfully downloaded all segments.");

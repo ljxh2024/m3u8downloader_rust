@@ -1,6 +1,6 @@
 pub mod downloader;
 
-use downloader::{ChannelMessage, DownloadManager, DownloadTask};
+use downloader::{ChannelMessage, DownloadManager, DownloadState, DownloadTask};
 use reqwest::Client;
 use std::{error::Error, rc::Rc};
 use tokio::{process::Command, sync::mpsc, time::Duration};
@@ -66,7 +66,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
             ui.set_enable_pause_btn(false);
             ui.invoke_show_message("Pausing...".into(), false);
 
-            download_task_clone.state.set(2);
+            download_task_clone.state.set(DownloadState::Paused as u8);
         }
     });
 
@@ -83,8 +83,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
             ui.set_enable_cancel_btn(false);
             ui.invoke_show_message("Canceling...".into(), false);
 
-            let old_state = download_task_clone.state.replace(0);
-            if old_state == 2 {
+            let old_state = download_task_clone.state.replace(DownloadState::Idle as u8);
+            if old_state == DownloadState::Paused as u8 {
                 // 重置任务
                 download_task_clone.clear();
                 ui.invoke_task_finished("You canceled the download.".into(), true);
@@ -152,12 +152,12 @@ async fn consume_channel_message(
                         ""
                     }
                 );
-                
+
                 update_ui(&ui_weak, move |ui| {
                     ui.invoke_show_message(msg.into(), false);
-                        ui.set_enable_pause_btn(true);
-                        ui.set_enable_cancel_btn(true);
-                        ui.set_total_nums(total_nums as i32);
+                    ui.set_enable_pause_btn(true);
+                    ui.set_enable_cancel_btn(true);
+                    ui.set_total_nums(total_nums as i32);
                 });
             }
             // 实时更新下载进度
@@ -226,9 +226,9 @@ async fn parse_download(
     );
 
     // 新下载，重新解析内容
-    if download_state == 0 {
+    if download_state == DownloadState::Idle as u8 {
         download_manager
-            .load_task(Rc::clone(&download_task), Rc::clone(&client))
+            .load_new_task(Rc::clone(&download_task), Rc::clone(&client))
             .await?;
     }
 
@@ -256,6 +256,9 @@ fn format_size(size: usize) -> String {
 }
 
 /// 简化UI更新代码量
-fn update_ui<F>(ui_weak: &slint::Weak<AppWindow>, f: F) where F: FnOnce(AppWindow) + Send + 'static {
+fn update_ui<F>(ui_weak: &slint::Weak<AppWindow>, f: F)
+where
+    F: FnOnce(AppWindow) + Send + 'static,
+{
     ui_weak.upgrade_in_event_loop(f).unwrap();
 }
