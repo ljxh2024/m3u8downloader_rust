@@ -155,13 +155,13 @@ impl DownloadManager {
     ///
     /// # Argument
     /// * `ui` - `AppWindow`实例的引用
-    /// * `is_new_download_task` - 是否新的下载任务
+    /// * `is_new_download` - 是否新的下载任务
     ///
     /// # Returns
     /// * ` Result<Self, String>`
-    pub async fn new(ui: &AppWindow, is_new_download_task: bool) -> Result<Self, String> {
+    pub async fn new(ui: &AppWindow, is_new_download: bool) -> Result<Self, String> {
         let video_name = ui.get_video_name();
-        let (save_path, video_name, m3u8_url) = if is_new_download_task {
+        let (save_path, video_name, m3u8_url) = if is_new_download {
             let (save_path, video_name) =
                 create_safe_save_path(&ui.get_work_dir(), &video_name).await?;
             let m3u8_url = ui.get_m3u8_url().to_string();
