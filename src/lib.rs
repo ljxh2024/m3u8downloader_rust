@@ -17,7 +17,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
     let window = AppWindow::new()?;
 
     // UI界面默认语言，注释掉则自动根据系统区域设置，当前支持：中文/英文
-    // let _ = slint::select_bundled_translation("en");
+    let _ = slint::select_bundled_translation("en");
     // 初始化信道
     let (tx, mut rx) = mpsc::channel(20);
     // 下载任务
@@ -58,7 +58,6 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // 暂停
     window.on_pause_download({
         let ui_weak = window.as_weak();
-        // let tx_clone = tx.clone();
         let download_task_clone = Rc::clone(&download_task);
 
         move || {
@@ -153,70 +152,57 @@ async fn consume_channel_message(
                         ""
                     }
                 );
-                ui_weak
-                    .upgrade_in_event_loop(move |ui| {
-                        ui.invoke_show_message(msg.into(), false);
+                
+                update_ui(&ui_weak, move |ui| {
+                    ui.invoke_show_message(msg.into(), false);
                         ui.set_enable_pause_btn(true);
                         ui.set_enable_cancel_btn(true);
                         ui.set_total_nums(total_nums as i32);
-                    })
-                    .unwrap();
+                });
             }
             // 实时更新下载进度
             ChannelMessage::Progress { segment_size } => {
-                // downloaded_segment_sizes += segment_size;
-                // downloaded_segment_nums += 1;
                 download_task.downloaded_sizes.update(|v| v + segment_size);
                 download_task.downloaded_nums.update(|v| v + 1);
 
                 let downloaded_sizes = download_task.downloaded_sizes.get();
                 let downloaded_nums = download_task.downloaded_nums.get() as i32;
 
-                ui_weak
-                    .upgrade_in_event_loop(move |ui| {
-                        ui.set_downloaded_sizes(format_size(downloaded_sizes).into());
-                        ui.set_downloaded_nums(downloaded_nums);
-                    })
-                    .unwrap();
+                update_ui(&ui_weak, move |ui| {
+                    ui.set_downloaded_sizes(format_size(downloaded_sizes).into());
+                    ui.set_downloaded_nums(downloaded_nums);
+                });
             }
             // 任务暂停成功
             ChannelMessage::Paused => {
-                ui_weak
-                    .upgrade_in_event_loop(move |ui| {
-                        ui.set_enable_start_btn(true);
-                        ui.set_enable_cancel_btn(true);
-                        ui.set_download_state(2);
-                        ui.invoke_show_message("You paused the download.".into(), false);
-                    })
-                    .unwrap();
+                update_ui(&ui_weak, |ui| {
+                    ui.set_enable_start_btn(true);
+                    ui.set_enable_cancel_btn(true);
+                    ui.set_download_state(2);
+                    ui.invoke_show_message("You paused the download.".into(), false);
+                });
             }
             // 任务取消成功（非暂停状态下的取消）
             ChannelMessage::Canceled => {
-                ui_weak
-                    .upgrade_in_event_loop(move |ui| {
-                        ui.invoke_task_finished("You canceled the download.".into(), true);
-                    })
-                    .unwrap();
+                update_ui(&ui_weak, |ui| {
+                    ui.invoke_task_finished("You canceled the download.".into(), true);
+                });
             }
             // 下载完毕
             ChannelMessage::Downloaded {
                 message,
                 have_failed_segment,
             } => {
-                ui_weak
-                    .upgrade_in_event_loop(move |ui| {
-                        ui.invoke_task_finished(message.into(), false);
-                        ui.set_have_failed_segment(have_failed_segment);
-                    })
-                    .unwrap();
+                update_ui(&ui_weak, move |ui| {
+                    ui.invoke_task_finished(message.into(), false);
+                    ui.set_have_failed_segment(have_failed_segment);
+                });
             }
             // 合并分片
             ChannelMessage::Merging => {
-                ui_weak
-                    .upgrade_in_event_loop(move |ui| {
-                        ui.invoke_show_message("Merging segments into MP4...".into(), false);
-                    })
-                    .unwrap();
+                update_ui(&ui_weak, |ui| {
+                    ui.invoke_show_message("Merging segments into MP4...".into(), false);
+                });
             }
         }
     }
@@ -267,4 +253,9 @@ fn format_size(size: usize) -> String {
     }
 
     format!("{:.2} {}", size, UNITS[unit_index])
+}
+
+/// 简化UI更新代码量
+fn update_ui<F>(ui_weak: &slint::Weak<AppWindow>, f: F) where F: FnOnce(AppWindow) + Send + 'static {
+    ui_weak.upgrade_in_event_loop(f).unwrap();
 }

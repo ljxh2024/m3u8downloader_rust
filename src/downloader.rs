@@ -76,14 +76,11 @@ pub struct DownloadTask {
 impl DownloadTask {
     pub fn clear(&self) {
         self.total_nums.set(0);
-        self.downloaded_nums.set(0);
-        self.downloaded_sizes.set(0);
         self.state.set(0);
 
         self.wait_download_segments.take();
         self.downloaded_segments.take();
         self.failed_segments.take();
-        // self.save_path.take(); 不能清空，否则不能打开文件失败的文件
 
         self.is_master_playlist.set(false);
     }
@@ -163,10 +160,12 @@ impl DownloadManager {
 
         // 3、初始化 DownloadTask
         let segments_len = segments.len();
-        *download_task.wait_download_segments.borrow_mut() = segments.clone(); // 等待下载的分片
-        download_task.is_master_playlist.set(is_master_playlist); // 是否大师列表
-        download_task.total_nums.set(segments_len); // 总分片数
-        *download_task.save_path.borrow_mut() = self.save_path.clone(); // 保存目录
+        *download_task.wait_download_segments.borrow_mut() = segments.clone();
+        download_task.is_master_playlist.set(is_master_playlist);
+        download_task.total_nums.set(segments_len);
+        *download_task.save_path.borrow_mut() = self.save_path.clone();
+        download_task.downloaded_nums.set(0);
+        download_task.downloaded_sizes.set(0);
 
         Ok(())
     }
@@ -401,9 +400,6 @@ impl DownloadManager {
             }
         }
 
-        // 重置 download_task
-        download_task.clear();
-
         // 更新UI
         let _ = tx
             .send(ChannelMessage::Downloaded {
@@ -411,6 +407,9 @@ impl DownloadManager {
                 have_failed_segment: failed_nums > 0,
             })
             .await;
+
+        // 重置 download_task
+        download_task.clear();
 
         Ok(())
     }
