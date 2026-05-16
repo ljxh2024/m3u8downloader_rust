@@ -59,7 +59,7 @@ msgstr "下载完成后合并为MP4"
 
 #: app-window.slint:211
 msgctxt "AppWindow"
-msgid "Remove segments after merged"
+msgid "Delete segments after merged"
 msgstr "合并后删除分片"
 
 #: app-window.slint:219

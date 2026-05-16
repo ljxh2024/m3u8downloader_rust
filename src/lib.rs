@@ -1,8 +1,8 @@
 pub mod downloader;
 
-use downloader::{ChannelMessage, DownloadManager, DownloadState, DownloadTask};
+use downloader::{ChannelMessage, DownloadManager, DownloadTask};
 use reqwest::Client;
-use std::{error::Error, rc::Rc};
+use std::{error::Error, rc::Rc, sync::atomic::Ordering};
 use tokio::{process::Command, sync::mpsc, time::Duration};
 
 // 下载失败的文件名
@@ -17,7 +17,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
     let window = AppWindow::new()?;
 
     // UI界面默认语言，注释掉则自动根据系统区域设置，当前支持：中文/英文
-    let _ = slint::select_bundled_translation("en");
+    // let _ = slint::select_bundled_translation("en");
     // 初始化信道
     let (tx, mut rx) = mpsc::channel(20);
     // 下载任务
@@ -48,7 +48,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
                 {
                     ui.invoke_show_message(e.to_string().into(), true);
                     ui.set_enable_start_btn(true);
-                    ui.set_download_state(download_task_clone.state.get() as i32);
+                    ui.set_download_state(download_task_clone.get_download_state() as i32);
                 }
             }))
             .unwrap();
@@ -66,7 +66,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
             ui.set_enable_pause_btn(false);
             ui.invoke_show_message("Pausing...".into(), false);
 
-            download_task_clone.state.set(DownloadState::Paused as u8);
+            download_task_clone.set_download_state(2);
         }
     });
 
@@ -83,11 +83,16 @@ pub fn run() -> Result<(), slint::PlatformError> {
             ui.set_enable_cancel_btn(false);
             ui.invoke_show_message("Canceling...".into(), false);
 
-            let old_state = download_task_clone.state.replace(DownloadState::Idle as u8);
-            if old_state == DownloadState::Paused as u8 {
-                // 重置任务
-                download_task_clone.clear();
+            let old_state = download_task_clone.update_download_state(0);
+            if old_state == 2 {
                 ui.invoke_task_finished("You canceled the download.".into(), true);
+
+                // 重置任务
+                let download_task_clone = Rc::clone(&download_task_clone);
+                slint::spawn_local(async move {
+                    download_task_clone.reset().await;
+                })
+                .unwrap();
             }
         }
     });
@@ -111,7 +116,11 @@ pub fn run() -> Result<(), slint::PlatformError> {
         move || {
             let download_task_clone = Rc::clone(&download_task_clone);
             slint::spawn_local(async move {
-                let file_path = download_task_clone.save_path.borrow().join(FAILED_FILENAME);
+                let file_path = download_task_clone
+                    .save_path
+                    .lock()
+                    .await
+                    .join(FAILED_FILENAME);
                 if file_path.is_file() {
                     #[cfg(windows)]
                     {
@@ -162,15 +171,18 @@ async fn consume_channel_message(
             }
             // 实时更新下载进度
             ChannelMessage::Progress { segment_size } => {
-                download_task.downloaded_sizes.update(|v| v + segment_size);
-                download_task.downloaded_nums.update(|v| v + 1);
-
-                let downloaded_sizes = download_task.downloaded_sizes.get();
-                let downloaded_nums = download_task.downloaded_nums.get() as i32;
+                let downloaded_sizes = download_task
+                    .downloaded_sizes
+                    .fetch_add(segment_size, Ordering::Relaxed)
+                    + segment_size;
+                let downloaded_nums = download_task
+                    .downloaded_nums
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
 
                 update_ui(&ui_weak, move |ui| {
                     ui.set_downloaded_sizes(format_size(downloaded_sizes).into());
-                    ui.set_downloaded_nums(downloaded_nums);
+                    ui.set_downloaded_nums(downloaded_nums as i32);
                 });
             }
             // 任务暂停成功
@@ -214,10 +226,8 @@ async fn parse_download(
     download_task: Rc<DownloadTask>,
     tx: mpsc::Sender<ChannelMessage>,
 ) -> Result<(), Box<dyn Error>> {
-    // 选择状态 0,1,2
-    let download_state = download_task.state.get();
     // 初始化下载管理
-    let download_manager = DownloadManager::new(ui, download_state).await?;
+    let download_manager = DownloadManager::new(ui, download_task.is_new_download()).await?;
     let client = Rc::new(
         Client::builder()
             .connect_timeout(Duration::from_secs(download_manager.connect_timeout))
@@ -226,7 +236,7 @@ async fn parse_download(
     );
 
     // 新下载，重新解析内容
-    if download_state == DownloadState::Idle as u8 {
+    if download_task.is_new_download() {
         download_manager
             .load_new_task(Rc::clone(&download_task), Rc::clone(&client))
             .await?;

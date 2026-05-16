@@ -208,7 +208,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     CheckBox {
-                        text: @tr("Remove segments after merged");
+                        text: @tr("Delete segments after merged");
                         checked <=> root.is-delete-segment;
                         enabled: root.is-merge && root.download-state != 1;
                     }

@@ -9,16 +9,16 @@ use regex::Regex;
 use reqwest::{Client, header::CONTENT_TYPE};
 use slint::SharedString;
 use std::{
-    cell::{Cell, RefCell},
     error::Error,
     path::{Path, PathBuf},
     rc::Rc,
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering},
 };
 use tokio::{
     fs,
     io::{self, AsyncWriteExt, BufWriter},
     process::Command,
-    sync::mpsc,
+    sync::{Mutex, mpsc},
     time::{Duration, sleep},
 };
 use url::Url;
@@ -33,6 +33,10 @@ static MASTER_RE: Lazy<regex::Regex> = Lazy::new(|| Regex::new(r"RESOLUTION=(\d+
 const M3U8_FILENAME: &str = "index.m3u8";
 // 下载失败的文件名
 const FAILED_FILENAME: &str = "failed.txt";
+// 视频名称最大长度
+const MAX_VIDEO_NAME_LEN: usize = 50;
+// 删除分片最大并发数
+const DELETE_CONCURRENCY: usize = 20;
 
 /// 信道消息类型
 pub enum ChannelMessage {
@@ -52,13 +56,6 @@ pub enum ChannelMessage {
     Merging,
 }
 
-/// 下载状态
-pub enum DownloadState {
-    Idle = 0,
-    Downloading = 1,
-    Paused = 2,
-}
-
 /// 分片信息
 #[derive(Debug, Clone)]
 pub struct Segment {
@@ -69,27 +66,72 @@ pub struct Segment {
 /// 下载任务信息
 #[derive(Debug, Default)]
 pub struct DownloadTask {
-    pub total_nums: Cell<usize>,                       // 总分片数
-    pub downloaded_nums: Cell<u32>,                    // 已下载分片数，成功一个就加 1
-    pub downloaded_sizes: Cell<usize>,                 // 已下载的文件大小
-    pub state: Cell<u8>,                               // 0未下载或取消下载，1下载中，2暂停
-    pub wait_download_segments: RefCell<Vec<Segment>>, // 待下载的分片
-    pub downloaded_segments: RefCell<Vec<String>>,     // 已下载的分片，存储分片名，用以删除分片
-    pub failed_segments: RefCell<Vec<Segment>>,        // 下载失败的分片
-    pub save_path: RefCell<PathBuf>,                   // 保存目录
-    pub is_master_playlist: Cell<bool>,                // 是否大师列表
+    pub total_nums: AtomicUsize,                     // 总分片数
+    pub downloaded_nums: AtomicU32,                  // 已下载分片数，成功一个就加 1
+    pub downloaded_sizes: AtomicUsize,               // 已下载的文件大小
+    download_state: AtomicU8,                        // 0未下载或取消下载，1下载中，2暂停
+    pub wait_download_segments: Mutex<Vec<Segment>>, // 待下载的分片
+    pub downloaded_segments: Mutex<Vec<String>>,     // 已下载的分片，存储分片名，用以删除分片
+    pub failed_segments: Mutex<Vec<Segment>>,        // 下载失败的分片
+    pub save_path: Mutex<PathBuf>,                   // 保存目录
+    pub is_master_playlist: AtomicBool,              // 是否大师列表
 }
 
 impl DownloadTask {
-    pub fn clear(&self) {
-        self.total_nums.set(0);
-        self.state.set(DownloadState::Idle as u8);
+    /// 重置部分字段为初始值
+    pub async fn reset(&self) {
+        self.total_nums.store(0, Ordering::Relaxed);
+        self.download_state.store(0, Ordering::Relaxed);
 
-        self.wait_download_segments.take();
-        self.downloaded_segments.take();
-        self.failed_segments.take();
+        self.wait_download_segments.lock().await.clear();
+        self.downloaded_segments.lock().await.clear();
+        self.failed_segments.lock().await.clear();
 
-        self.is_master_playlist.set(false);
+        self.is_master_playlist.store(false, Ordering::Relaxed);
+    }
+
+    /// 是否新的下载任务
+    pub fn is_new_download(&self) -> bool {
+        self.download_state.load(Ordering::Acquire) == 0
+    }
+
+    /// 是否暂停
+    pub fn is_pause(&self) -> bool {
+        self.download_state.load(Ordering::Acquire) == 2
+    }
+
+    /// 是否取消
+    pub fn is_cancel(&self) -> bool {
+        self.download_state.load(Ordering::Acquire) == 0
+    }
+
+    /// 是否正在下载
+    pub fn is_downloading(&self) -> bool {
+        self.download_state.load(Ordering::Acquire) == 1
+    }
+
+    /// 获取当前下载状态
+    pub fn get_download_state(&self) -> u8 {
+        self.download_state.load(Ordering::Relaxed)
+    }
+
+    /// 设置下载状态
+    ///
+    /// # Argment
+    /// * `state` - 0 默认/取消，1下载中，2暂停
+    pub fn set_download_state(&self, state: u8) {
+        self.download_state.store(state, Ordering::Release);
+    }
+
+    /// 更新下载状态
+    ///
+    /// # Argment
+    /// * `new_value` - 新值
+    ///
+    /// # Return
+    /// * `u8` 返回旧值
+    pub fn update_download_state(&self, new_value: u8) -> u8 {
+        self.download_state.swap(new_value, Ordering::AcqRel)
     }
 }
 
@@ -110,9 +152,16 @@ impl DownloadManager {
     /// 提取用户输入，创建一个新的下载任务配置
     ///
     /// 若是新下载任务，必须对M3U8地址、并发数和连接超时做验证
-    pub async fn new(ui: &AppWindow, download_state: u8) -> Result<Self, String> {
+    ///
+    /// # Argument
+    /// * `ui` - `AppWindow`实例的引用
+    /// * `is_new_download_task` - 是否新的下载任务
+    ///
+    /// # Returns
+    /// * ` Result<Self, String>`
+    pub async fn new(ui: &AppWindow, is_new_download_task: bool) -> Result<Self, String> {
         let video_name = ui.get_video_name();
-        let (save_path, video_name, m3u8_url) = if download_state == DownloadState::Idle as u8 {
+        let (save_path, video_name, m3u8_url) = if is_new_download_task {
             let (save_path, video_name) =
                 create_safe_save_path(&ui.get_work_dir(), &video_name).await?;
             let m3u8_url = ui.get_m3u8_url().to_string();
@@ -166,13 +215,19 @@ impl DownloadManager {
         let (segments, is_master_playlist) = self.parse_m3u8(Rc::clone(&client), save_path).await?;
 
         // 3、初始化 DownloadTask
-        let segments_len = segments.len();
-        *download_task.wait_download_segments.borrow_mut() = segments.clone();
-        download_task.is_master_playlist.set(is_master_playlist);
-        download_task.total_nums.set(segments_len);
-        *download_task.save_path.borrow_mut() = self.save_path.clone();
-        download_task.downloaded_nums.set(0);
-        download_task.downloaded_sizes.set(0);
+        let total_nums = segments.len();
+
+        *download_task.wait_download_segments.lock().await = segments;
+        *download_task.save_path.lock().await = self.save_path.clone();
+
+        download_task
+            .total_nums
+            .store(total_nums, Ordering::Release);
+        download_task.downloaded_nums.store(0, Ordering::Release);
+        download_task.downloaded_sizes.store(0, Ordering::Release);
+        download_task
+            .is_master_playlist
+            .store(is_master_playlist, Ordering::Release);
 
         Ok(())
     }
@@ -257,7 +312,7 @@ impl DownloadManager {
             }
         }
 
-        writer.flush().await.unwrap();
+        writer.flush().await?;
 
         if segments.is_empty() {
             return Err("No segments available for download.".into());
@@ -275,20 +330,20 @@ impl DownloadManager {
     ) -> Result<(), Box<dyn Error>> {
         // 通知UI，准备下载
         tx.send(ChannelMessage::Start {
-            total_nums: download_task.total_nums.get(),
-            is_master_playlist: download_task.is_master_playlist.get(),
+            total_nums: download_task.total_nums.load(Ordering::Acquire),
+            is_master_playlist: download_task.is_master_playlist.load(Ordering::Acquire),
         })
         .await?;
 
-        download_task.state.set(DownloadState::Downloading as u8);
+        download_task.set_download_state(1);
 
-        let segments = download_task.wait_download_segments.borrow().clone();
+        let segments = download_task.wait_download_segments.lock().await.clone();
         let concurrency = self.concurrency.min(segments.len()); // 并发数
         let segments_iter = segments.into_iter();
         let download_task_clone = Rc::clone(&download_task);
         let tx_clone_for_download = tx.clone();
 
-        let save_path = download_task.save_path.borrow().clone();
+        let save_path = download_task.save_path.lock().await.clone();
         let save_path = Path::new(&save_path);
 
         futures::stream::iter(segments_iter)
@@ -298,9 +353,10 @@ impl DownloadManager {
                 let tx_clone_for_download = tx_clone_for_download.clone();
 
                 async move {
-                    if download_task_clone.state.get() != DownloadState::Downloading as u8 {
+                    if !download_task_clone.is_downloading() {
                         return;
                     }
+
                     download_single_segment(
                         segment,
                         client,
@@ -316,45 +372,44 @@ impl DownloadManager {
 
         // 并发下载结束
 
-        if download_task.state.get() == DownloadState::Paused as u8 {
-            let downloaded_segments = download_task.downloaded_segments.borrow().clone();
-            // 过滤已下载的分片，重新赋值
-            let new = download_task
-                .wait_download_segments
-                .borrow()
-                .iter()
-                .filter(|&item| !downloaded_segments.contains(&item.name))
-                .cloned()
-                .collect();
-            *download_task.wait_download_segments.borrow_mut() = new;
+        // 暂停
+        if download_task.is_pause() {
+            let new = {
+                let wait_download_segments = download_task.wait_download_segments.lock().await;
+                let downloaded_segments = download_task.downloaded_segments.lock().await;
+                wait_download_segments
+                    .iter()
+                    .filter(|&item| !downloaded_segments.contains(&item.name))
+                    .cloned()
+                    .collect()
+            };
+            *download_task.wait_download_segments.lock().await = new;
             // 清除，否则继续下载又有失败时会累加
-            download_task.failed_segments.take();
+            download_task.failed_segments.lock().await.clear();
+
             let _ = tx.send(ChannelMessage::Paused).await;
             return Ok(());
         }
 
-        if download_task.state.get() == DownloadState::Idle as u8 {
+        // 取消
+        if download_task.is_cancel() {
             let _ = tx.send(ChannelMessage::Canceled).await;
             // 重置 download_task
-            download_task.clear();
+            download_task.reset().await;
             return Ok(());
         }
 
         // 任务正常结束，重置下载状态
-        download_task.state.set(DownloadState::Idle as u8);
+        download_task.set_download_state(0);
 
         // 构建最终消息
         let mut final_msg = String::from("Successfully downloaded all segments.");
         // 下载失败的分片数
-        let failed_segments = download_task.failed_segments.borrow().clone();
+        let failed_segments = download_task.failed_segments.lock().await.clone();
         let failed_nums = failed_segments.len() as u32;
 
         if failed_nums > 0 {
-            final_msg = format!(
-                "{} segment{} failed to download.",
-                failed_nums,
-                format_complex(failed_nums)
-            );
+            final_msg = format!("{} failed to download.", format_complex(failed_nums));
             // 记录下载失败的分片
             if let Ok(mut file) = fs::File::create(save_path.join(FAILED_FILENAME)).await {
                 let mut failed_str = String::default();
@@ -384,7 +439,7 @@ impl DownloadManager {
                     "-y",
                     &mp4_path,
                 ];
-                let downloaded_segments = download_task.downloaded_segments.borrow().clone();
+                let downloaded_segments = download_task.downloaded_segments.lock().await;
 
                 match merge_and_delete(
                     args,
@@ -416,7 +471,7 @@ impl DownloadManager {
             .await;
 
         // 重置 download_task
-        download_task.clear();
+        download_task.reset().await;
 
         Ok(())
     }
@@ -519,9 +574,18 @@ async fn extra_suffix_from_m3u8_content(
     Ok(String::from(".ts"))
 }
 
-/// 安全的创建保存目录,返回保存目录和视频名称
+/// 安全的创建保存目录
 ///
-/// work_dir是手动选择的工作目录，不需要做校验
+/// # Arguments
+/// * `work_dir` - 基础工作目录（调用者保证存在且可写）
+/// * `video_name` - 用户输入的视频名称
+///
+/// # Returns
+/// * `Ok((save_path, clean_name))` - 保存目录和清理后的文件名
+///
+/// # Errors
+/// * 当 video_name 为空时返回错误
+/// * 当无法创建目录时返回错误
 async fn create_safe_save_path(
     work_dir: &SharedString,
     video_name: &SharedString,
@@ -542,8 +606,8 @@ async fn create_safe_save_path(
     let mut clean_name: String = cleaned.chars().collect();
 
     // 限制视频名称长度
-    if clean_name.chars().count() > 50 {
-        clean_name = clean_name.chars().take(50).collect();
+    if clean_name.chars().count() > MAX_VIDEO_NAME_LEN {
+        clean_name = clean_name.chars().take(MAX_VIDEO_NAME_LEN).collect();
     }
 
     // 创建保存目录
@@ -598,7 +662,8 @@ async fn download_single_segment(
                 if ok {
                     download_task
                         .downloaded_segments
-                        .borrow_mut()
+                        .lock()
+                        .await
                         .push(segment.name.clone());
                     let _ = tx.send(ChannelMessage::Progress { segment_size }).await;
                     is_finish = true;
@@ -616,7 +681,8 @@ async fn download_single_segment(
     if !is_finish {
         download_task
             .failed_segments
-            .borrow_mut()
+            .lock()
+            .await
             .push(segment.clone());
     }
 }
@@ -647,37 +713,30 @@ async fn merge_and_delete(
     if is_delete_segment {
         // 删除 m3u8 文件
         let _ = fs::remove_file(save_path.join(M3U8_FILENAME)).await;
-        // 并发限制
-        let delete_concurrency = 20usize;
         // 已删除文件数
-        let deleted_counter = Rc::new(Cell::new(0u32));
+        let deleted_counter = Rc::new(AtomicU32::new(0));
 
         futures::stream::iter(downloaded_segments.iter())
-            .for_each_concurrent(delete_concurrency, |item| {
+            .for_each_concurrent(DELETE_CONCURRENCY, |item| {
                 let deleted_counter = Rc::clone(&deleted_counter);
                 async move {
                     let filepath = save_path.join(item);
                     if filepath.is_file() && fs::remove_file(&filepath).await.is_ok() {
-                        deleted_counter.update(|v| v + 1);
+                        deleted_counter.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             })
             .await;
         msg.push_str(&format!(
-            " and {} segment{} have been deleted.",
-            deleted_counter.get(),
-            format_complex(deleted_counter.get())
+            " and {} have been deleted.",
+            format_complex(deleted_counter.load(Ordering::Relaxed))
         ));
     }
 
     Ok(msg)
 }
 
-/// 处理英文复数
+/// 格式化单/多分片英文复数
 fn format_complex(n: u32) -> String {
-    if n > 1 {
-        String::from("s")
-    } else {
-        String::default()
-    }
+    format!("{} segment{}", n, if n > 1 { "s" } else { "" })
 }
