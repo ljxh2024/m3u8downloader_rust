@@ -35,11 +35,11 @@ export component AppWindow inherits Window {
     in-out property <bool> have-failed-segment: false;
 
     // 总分片数
-    in-out property <int> total_segment_nums;
+    in-out property <int> total_nums;
     // 已下载分片数
-    in-out property <int> downloaded_segment_nums;
+    in-out property <int> downloaded_nums;
     // 已下载分片大小(如：88.88 MB)
-    in-out property <string> downloaded_segment_sizes;
+    in-out property <string> downloaded_sizes;
 
     // 消息文本
     out property <string> message;
@@ -100,9 +100,9 @@ export component AppWindow inherits Window {
 
         if is-cancel {
             have-failed-segment = false;
-            total_segment_nums = 0;
-            downloaded_segment_nums = 0;
-            downloaded_segment_sizes = "";
+            total_nums = 0;
+            downloaded_nums = 0;
+            downloaded_sizes = "";
         }
 
         show-message(message, false);
@@ -198,7 +198,7 @@ export component AppWindow inherits Window {
                 // 合并分片选项
                 VerticalBox {
                     CheckBox {
-                        text: @tr("Merge to MP4 after all segments downloaded");
+                        text: @tr("Merge to MP4 after downloaded");
                         checked <=> root.is-merge;
                         enabled: root.download-state != 1;
                         toggled() => {
@@ -208,7 +208,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     CheckBox {
-                        text: @tr("Remove all segments after merging");
+                        text: @tr("Remove segments after merged");
                         checked <=> root.is-delete-segment;
                         enabled: root.is-merge && root.download-state != 1;
                     }
@@ -236,10 +236,10 @@ export component AppWindow inherits Window {
                 HorizontalBox {
                     padding-bottom: 0px;
                     Text {
-                        text: @tr("Progress") + (root.total_segment_nums > 0 ? root.downloaded_segment_nums + " / " + root.total_segment_nums : "");
+                        text: @tr("Progress ") + (root.total_nums > 0 ? root.downloaded_nums + " / " + root.total_nums : "");
                     }
                     Text {
-                        text: root.total_segment_nums > 0 ? root.downloaded_segment_sizes : "";
+                        text: root.total_nums > 0 ? root.downloaded_sizes : "";
                     }
                 }
                 // 消息文本
@@ -278,7 +278,7 @@ export component AppWindow inherits Window {
                 }
                 Text {
                     y: 160px;
-                    text: "Version 0.1.1";
+                    text: "Version 0.1.2";
                 }
                 Text {
                     y: 180px;

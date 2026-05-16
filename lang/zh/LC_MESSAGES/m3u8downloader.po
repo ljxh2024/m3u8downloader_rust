@@ -54,12 +54,12 @@ msgstr "连接超时(秒)"
 
 #: app-window.slint:201
 msgctxt "AppWindow"
-msgid "Merge to MP4 after all segments downloaded"
+msgid "Merge to MP4 after downloaded"
 msgstr "下载完成后合并为MP4"
 
 #: app-window.slint:211
 msgctxt "AppWindow"
-msgid "Remove all segments after merging"
+msgid "Remove segments after merged"
 msgstr "合并后删除分片"
 
 #: app-window.slint:219
@@ -84,8 +84,8 @@ msgstr "取消"
 
 #: app-window.slint:239
 msgctxt "AppWindow"
-msgid "Progress"
-msgstr "下载进度"
+msgid "Progress "
+msgstr "下载进度 "
 
 #: app-window.slint:264
 msgctxt "AppWindow"
