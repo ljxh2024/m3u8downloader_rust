@@ -652,7 +652,7 @@ async fn extract_segments(
         .filter(|line| !line.starts_with('#'))
         .count();
     let mut segments: Vec<Segment> = Vec::with_capacity(segment_count);
-    let mut writer = BufWriter::new(fs::File::create(save_path.join(M3U8_FILENAME)).await?);
+    let mut writer = BufWriter::new(File::create(save_path.join(M3U8_FILENAME)).await?);
     let mut key_index = 1u32;
     let mut segment_index = 0u32;
 
