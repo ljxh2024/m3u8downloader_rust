@@ -3,6 +3,8 @@ pub mod downloader;
 use downloader::{ChannelMessage, DownloadConfig, DownloadManager, DownloadState};
 use std::{error::Error, sync::Arc};
 use tokio::sync::mpsc;
+use slint::PhysicalPosition;
+use winsafe::{GetSystemMetrics, co::SM};
 
 slint::include_modules!();
 
@@ -14,6 +16,11 @@ const FAILED_FILENAME: &str = "failed.txt";
 /// 应用入口
 pub fn run() -> Result<(), slint::PlatformError> {
     let window = AppWindow::new()?;
+
+    // 控制窗口位置
+    let x = (GetSystemMetrics(SM::CXSCREEN) - 380) / 2;
+    let y = (GetSystemMetrics(SM::CYSCREEN) - 600) / 2; // 尽量偏高
+    window.window().set_position(slint::WindowPosition::Physical(PhysicalPosition { x, y }));
 
     // UI界面默认语言，注释掉则自动根据系统区域设置，当前支持：中文/英文
     // let _ = slint::select_bundled_translation("en");
