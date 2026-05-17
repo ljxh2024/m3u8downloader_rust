@@ -172,11 +172,11 @@ async fn consume_channel_message(
                 });
             }
             // 任务暂停成功
-            ChannelMessage::Paused { state } => {
+            ChannelMessage::Paused => {
                 update_ui(&ui_weak, move |ui| {
                     ui.set_enable_start_btn(true);
                     ui.set_enable_cancel_btn(true);
-                    ui.set_download_state(state as i32);
+                    ui.set_download_state(DownloadState::Paused as i32);
                     ui.invoke_show_message("You paused the download.".into(), false);
                 });
             }

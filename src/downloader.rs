@@ -58,9 +58,7 @@ pub enum ChannelMessage {
         total_nums: usize, // 总分片数
         is_new_download: bool,
     },
-    Paused {
-        state: DownloadState, // 当前下载状态
-    },
+    Paused,
     Canceled,
     Progress {
         downloaded_nums: u32,    // 已下载的分片数
@@ -249,9 +247,7 @@ impl DownloadManager {
             self.failed_segments.lock().await.clear();
 
             let _ = tx
-                .send(ChannelMessage::Paused {
-                    state: DownloadState::Paused,
-                })
+                .send(ChannelMessage::Paused)
                 .await;
             return Ok(());
         }
@@ -263,9 +259,7 @@ impl DownloadManager {
             return Ok(());
         }
 
-        // 任务正常结束，重置下载状态
-        self.set_download_state(DownloadState::Idle).await;
-
+        // 任务正常结束
         // 构建最终消息
         let mut final_msg = String::from("Successfully downloaded all segments.");
 
@@ -276,13 +270,11 @@ impl DownloadManager {
             // 记录下载失败的分片
             if let Ok(mut file) = File::create(save_path.join(FAILED_FILENAME)).await {
                 let failed_segments = self.failed_segments.lock().await;
+                let mut buffer = String::new();
                 for segment in failed_segments.iter() {
-                    let _ = file
-                        .write_all(
-                            format!("{} - {}\n", segment.name, segment.download_url).as_bytes(),
-                        )
-                        .await;
+                    buffer.push_str(&format!("{} - {}\n", segment.name, segment.download_url));
                 }
+                file.write_all(buffer.as_bytes()).await?;
             }
         } else {
             // 合并分片
@@ -732,13 +724,13 @@ async fn merge_and_delete(
         return Err(io::Error::other("Failed to merge the segments."));
     }
 
-    let mut msg = String::from("Successfully merged");
+    let mut msg = String::from("Successfully merged!");
 
     // 删除所有分片，包括key
     if is_delete_segment {
         // 删除 m3u8 文件
         let _ = fs::remove_file(save_path.join(M3U8_FILENAME)).await;
-        // 已删除文件数 单线程使用 Rc
+        // 已删除文件数
         let deleted_counter = Arc::new(AtomicU32::new(0));
 
         futures::stream::iter(downloaded_segments)
@@ -755,7 +747,7 @@ async fn merge_and_delete(
 
         let deleted = deleted_counter.load(Ordering::Relaxed);
         msg.push_str(&format!(
-            " and {} segment{} have been deleted.",
+            " {} segment{} have been deleted.",
             deleted,
             if deleted > 1 { "s" } else { "" }
         ));
