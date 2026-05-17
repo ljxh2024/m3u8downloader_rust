@@ -227,15 +227,14 @@ async fn parse_download(
 
 /// 格式化大小显示
 fn format_size(size: usize) -> String {
-    if size <= 1024 {
-        return String::from("1 KB");
-    }
-
-    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut size = size as f64;
     let mut unit_index = 0;
 
-    while size > 1024.0 && unit_index < UNITS.len() - 1 {
+    for _ in 0..UNITS.len() - 1 {
+        if size < 1024.0 {
+            break;
+        }
         size /= 1024.0;
         unit_index += 1;
     }
