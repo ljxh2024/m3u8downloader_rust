@@ -16,13 +16,6 @@
 - [x] 浅色/暗黑主题自适应
 - [ ] 支持默认设置，如请求头、代理模式等。
 
-## 使用
-
-二选一
-
-- 克隆本项目手动构建
-- 下载 `exe` 文件：[m3u8downloader-x86_64-v0.1.3.exe](http://124.71.107.97/res/m3u8downloader-x86_64-v0.1.3.exe)
-
 ## 截图
 
 <div style="display: flex; gap: 10px;">
