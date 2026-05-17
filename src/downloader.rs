@@ -3,7 +3,7 @@
 //! `downloader` 主要管理M3U8的解析和下载
 
 use crate::AppWindow;
-use dashmap::DashMap;
+use dashmap::DashSet;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -12,7 +12,6 @@ use slint::SharedString;
 use std::{
     error::Error,
     path::{Path, PathBuf},
-    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicU32, AtomicUsize, Ordering},
@@ -35,8 +34,6 @@ const DELETE_CONCURRENCY: usize = 20;
 const MAX_VIDEO_NAME_LEN: usize = 50;
 // :todo USER-AGENT，后期引入请求头后改为自定义
 const APP_USER_AGENT: &str = "Chrome/147";
-// 下载成功的记录键名
-const FINISHED_KEY: &str = "finished";
 // 下载失败的文件名
 const FAILED_FILENAME: &str = "failed.txt";
 
@@ -61,15 +58,17 @@ pub enum ChannelMessage {
         total_nums: usize, // 总分片数
         is_new_download: bool,
     },
-    Paused,
+    Paused {
+        state: DownloadState, // 当前下载状态
+    },
     Canceled,
     Progress {
         downloaded_nums: u32,    // 已下载的分片数
         downloaded_sizes: usize, // 已下载的大小
     },
     Downloaded {
-        message: String,    // 消息
-        is_completed: bool, // 是否完整下载所有分片
+        message: String,           // 消息
+        have_failed_segment: bool, // 是否有下载失败的分片
     },
     Merging,
 }
@@ -86,8 +85,8 @@ pub struct Segment {
 pub struct DownloadManager {
     download_state: RwLock<DownloadState>,
     segments: Mutex<Vec<Segment>>,
-    // 已下载的分片，仅存储分片名称，高并发频繁写入，使用 DashMap 无锁结构
-    downloaded_segments: DashMap<&'static str, Vec<String>>,
+    // 已下载的分片，仅存储分片名称，高并发频繁写入，使用 DashSet 无锁结构
+    downloaded_segments: DashSet<String>,
     // 下载失败的分片，任务完成后再写入文件，一般下载失败的概率很小，使用 Mutex 即可
     failed_segments: Mutex<Vec<Segment>>,
     pub save_path: Mutex<PathBuf>, // 保存路径
@@ -101,7 +100,7 @@ impl DownloadManager {
         Self {
             download_state: RwLock::new(DownloadState::Idle),
             segments: Mutex::new(Vec::new()),
-            downloaded_segments: DashMap::new(),
+            downloaded_segments: DashSet::new(),
             failed_segments: Mutex::new(Vec::new()),
             save_path: Mutex::new(PathBuf::new()),
             downloaded_nums: AtomicU32::new(0),
@@ -167,8 +166,7 @@ impl DownloadManager {
         config: DownloadConfig,
         tx: mpsc::Sender<ChannelMessage>,
     ) -> Result<(), Box<dyn Error>> {
-        // 单线程先用 Rc 试试
-        let client = Rc::new(
+        let client = Arc::new(
             Client::builder()
                 .connect_timeout(Duration::from_secs(config.connect_timeout))
                 .user_agent(APP_USER_AGENT)
@@ -180,7 +178,7 @@ impl DownloadManager {
         let (segments, path_buf) = if self.is_idle().await {
             let save_path = Path::new(&config.save_path);
             let segments = self
-                .parse_m3u8(&config.m3u8_url, Rc::clone(&client), save_path)
+                .parse_m3u8(&config.m3u8_url, Arc::clone(&client), save_path)
                 .await?;
 
             self.segments.lock().await.clone_from(&segments);
@@ -214,7 +212,7 @@ impl DownloadManager {
         // 并发下载
         futures::stream::iter(segments)
             .for_each_concurrent(concurrency, move |segment| {
-                let client = Rc::clone(&client);
+                let client = Arc::clone(&client);
                 let tx_clone_for_download = tx_clone_for_download.clone();
 
                 async move {
@@ -237,24 +235,24 @@ impl DownloadManager {
         // 任务因暂停而提前结束，但可能还继续下载
         if self.is_paused().await {
             // 排除已下载的分片
-            let new_segments = {
-                let old = self.segments.lock().await;
-                self.downloaded_segments
-                    .get(FINISHED_KEY)
-                    .map(|finished| {
-                        old.iter()
-                            .filter(|s| !finished.contains(&s.name))
-                            .cloned()
-                            .collect::<Vec<Segment>>()
-                    })
-                    .unwrap_or_else(|| old.clone())
-            };
+            let new_segments = self
+                .segments
+                .lock()
+                .await
+                .iter()
+                .filter(|s| !self.downloaded_segments.contains(&s.name))
+                .cloned()
+                .collect::<Vec<Segment>>();
             // 更新待下载分片
             self.segments.lock().await.clone_from(&new_segments);
             // 清除下载失败的分片，重试时重新下载
             self.failed_segments.lock().await.clear();
 
-            let _ = tx.send(ChannelMessage::Paused).await;
+            let _ = tx
+                .send(ChannelMessage::Paused {
+                    state: DownloadState::Paused,
+                })
+                .await;
             return Ok(());
         }
 
@@ -290,7 +288,6 @@ impl DownloadManager {
             // 合并分片
             if config.is_merge {
                 let _ = tx.send(ChannelMessage::Merging).await;
-                let _ = tx.send(ChannelMessage::Merging).await;
                 let m3u8_path = save_path.join(M3U8_FILENAME).to_string_lossy().to_string();
                 let mp4_path = save_path
                     .join(format!("{}.mp4", config.video_name))
@@ -309,9 +306,9 @@ impl DownloadManager {
                 ];
                 let downloaded_segments = self
                     .downloaded_segments
-                    .get(FINISHED_KEY)
-                    .map(|entry| entry.value().clone())
-                    .unwrap_or_default();
+                    .iter()
+                    .map(|s| s.key().clone())
+                    .collect::<Vec<String>>();
 
                 match merge_and_delete(
                     args,
@@ -338,7 +335,7 @@ impl DownloadManager {
         let _ = tx
             .send(ChannelMessage::Downloaded {
                 message: final_msg,
-                is_completed: failed_nums > 0,
+                have_failed_segment: failed_nums > 0,
             })
             .await;
 
@@ -350,7 +347,7 @@ impl DownloadManager {
     /// 下载分片
     async fn download_single_segment(
         &self,
-        client: Rc<Client>,
+        client: Arc<Client>,
         save_path: &Path,
         segment: Segment,
         retry: u32,
@@ -387,10 +384,7 @@ impl DownloadManager {
 
                 // 记录下载成功的分片
                 if writer.flush().await.is_ok() && ok {
-                    self.downloaded_segments
-                        .entry(FINISHED_KEY)
-                        .or_default()
-                        .push(segment.name.clone());
+                    self.downloaded_segments.insert(segment.name.clone());
                     let downloaded_nums = self.downloaded_nums.fetch_add(1, Ordering::Relaxed) + 1;
                     let downloaded_sizes = self
                         .downloaded_sizes
@@ -423,7 +417,7 @@ impl DownloadManager {
     async fn parse_m3u8(
         &self,
         m3u8_url: &str,
-        client: Rc<Client>,
+        client: Arc<Client>,
         save_path: &Path,
     ) -> Result<Vec<Segment>, Box<dyn Error>> {
         let mut base_url = Url::parse(m3u8_url)?.join(".")?;
@@ -445,8 +439,8 @@ impl DownloadManager {
         }
 
         // 提取第一个分片，确定视频的 MIME 类型
-        let suffix = extra_suffix_from_m3u8_content(&client, &base_url, &content).await?;
-        let segments = extra_segments(&content, &base_url, save_path, &suffix).await?;
+        let suffix = extract_suffix_from_m3u8_content(&client, &base_url, &content).await?;
+        let segments = extract_segments(&content, &base_url, save_path, &suffix).await?;
 
         if segments.is_empty() {
             return Err("No segments found.".into());
@@ -557,7 +551,7 @@ async fn create_safe_save_path(
 }
 
 /// 获取M3U8内容，验证非空、content-type
-async fn fetch_m3u8_content(client: &Rc<Client>, url: &str) -> Result<String, Box<dyn Error>> {
+async fn fetch_m3u8_content(client: &Arc<Client>, url: &str) -> Result<String, Box<dyn Error>> {
     let resp = client.get(url).send().await?;
     if !resp.status().is_success() {
         return Err(format!("{}", resp.status()).into());
@@ -627,8 +621,8 @@ fn parse_m3u8_master(content: &str) -> Result<String, Box<dyn Error>> {
 }
 
 /// 提取视频内容 mime 类型，返回文件后缀名，目前暂支持以 image/ 开头的
-async fn extra_suffix_from_m3u8_content(
-    client: &Rc<Client>,
+async fn extract_suffix_from_m3u8_content(
+    client: &Arc<Client>,
     base_url: &Url,
     content: &str,
 ) -> Result<String, Box<dyn Error>> {
@@ -655,7 +649,7 @@ async fn extra_suffix_from_m3u8_content(
 }
 
 /// 提取M3U8分片并写入文件
-async fn extra_segments(
+async fn extract_segments(
     content: &str,
     base_url: &Url,
     save_path: &Path,
@@ -745,11 +739,11 @@ async fn merge_and_delete(
         // 删除 m3u8 文件
         let _ = fs::remove_file(save_path.join(M3U8_FILENAME)).await;
         // 已删除文件数 单线程使用 Rc
-        let deleted_counter = Rc::new(AtomicU32::new(0));
+        let deleted_counter = Arc::new(AtomicU32::new(0));
 
-        futures::stream::iter(downloaded_segments.iter())
+        futures::stream::iter(downloaded_segments)
             .for_each_concurrent(DELETE_CONCURRENCY, |item| {
-                let deleted_counter = Rc::clone(&deleted_counter);
+                let deleted_counter = Arc::clone(&deleted_counter);
                 async move {
                     let filepath = save_path.join(item);
                     if filepath.is_file() && fs::remove_file(&filepath).await.is_ok() {

@@ -2,7 +2,7 @@ pub mod downloader;
 
 use downloader::{ChannelMessage, DownloadConfig, DownloadManager, DownloadState};
 use std::{error::Error, sync::Arc};
-use tokio::{process::Command, sync::mpsc};
+use tokio::sync::mpsc;
 
 slint::include_modules!();
 
@@ -16,7 +16,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
     let window = AppWindow::new()?;
 
     // UI界面默认语言，注释掉则自动根据系统区域设置，当前支持：中文/英文
-    let _ = slint::select_bundled_translation("en");
+    // let _ = slint::select_bundled_translation("en");
     // 全局下载管理
     let download_manager = Arc::new(DownloadManager::new());
     // 使用信道通信
@@ -129,18 +129,8 @@ pub fn run() -> Result<(), slint::PlatformError> {
                     .lock()
                     .await
                     .join(FAILED_FILENAME);
-                println!("Failed file path: {:?}", file_path);
-                if file_path.is_file() {
-                    #[cfg(windows)]
-                    {
-                        Command::new("explorer")
-                            .arg(format!("/select,{}", file_path.to_string_lossy()))
-                            .spawn()
-                            .unwrap()
-                            .wait()
-                            .await
-                            .unwrap();
-                    }
+                if file_path.exists() {
+                    let _ = open::that(file_path);
                 }
             })
             .unwrap();
@@ -182,11 +172,11 @@ async fn consume_channel_message(
                 });
             }
             // 任务暂停成功
-            ChannelMessage::Paused => {
-                update_ui(&ui_weak, |ui| {
+            ChannelMessage::Paused { state } => {
+                update_ui(&ui_weak, move |ui| {
                     ui.set_enable_start_btn(true);
                     ui.set_enable_cancel_btn(true);
-                    ui.set_download_state(2);
+                    ui.set_download_state(state as i32);
                     ui.invoke_show_message("You paused the download.".into(), false);
                 });
             }
@@ -199,11 +189,11 @@ async fn consume_channel_message(
             // 下载完毕
             ChannelMessage::Downloaded {
                 message,
-                is_completed,
+                have_failed_segment,
             } => {
                 update_ui(&ui_weak, move |ui| {
                     ui.invoke_task_finished(message.into(), false);
-                    ui.set_have_failed_segment(is_completed);
+                    ui.set_have_failed_segment(have_failed_segment);
                 });
             }
             // 合并分片
