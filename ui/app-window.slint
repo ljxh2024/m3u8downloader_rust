@@ -10,7 +10,7 @@ import {
 import { InputTxt } from "input-txt.slint";
 
 export component AppWindow inherits Window {
-    title: "M3U8Downloader";
+    title: "M3U8Downloader_rust";
     width: 380px;
     height: 470px;
 
@@ -48,7 +48,7 @@ export component AppWindow inherits Window {
     // 主题切换时，非错误类型的消息文本颜色
     out property <color> normal-msg-color: Palette.color-scheme == ColorScheme.light ? #323130 : #e6e6e6;
     // 项目地址
-    out property <string> github: "https://github.com/ljxh2024/m3u8downloader";
+    out property <string> github: "https://github.com/ljxh2024/m3u8downloader_rust";
 
     // 选择工作目录
     callback select-dir();
@@ -274,7 +274,7 @@ export component AppWindow inherits Window {
             Rectangle {
                 Text {
                     y: 140px;
-                    text: "M3U8Downloader";
+                    text: "M3U8Downloader_rust";
                 }
                 Text {
                     y: 160px;

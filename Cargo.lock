@@ -2817,7 +2817,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "m3u8downloader"
+name = "m3u8downloader_rust"
 version = "0.1.3"
 dependencies = [
  "async-compat",

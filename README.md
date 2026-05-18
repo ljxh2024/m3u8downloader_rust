@@ -1,6 +1,6 @@
 [English](./README.md) | [简体中文](./README_zh.md)
 
-# M3U8Downloader
+# M3U8Downloader_rust
 
 A **M3U8** video downloader for the `Windows` desktop developed in the `Rust` language.
 

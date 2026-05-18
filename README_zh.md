@@ -1,4 +1,4 @@
-# M3U8Downloader
+# M3U8Downloader_rust
 
 使用 `Rust` 语言开发的 `Windows` 桌面端**M3U8**视频下载器。
 
