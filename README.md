@@ -2,17 +2,17 @@
 
 # M3U8Downloader_rust
 
-A **M3U8** video downloader for the `Windows` desktop developed in the `Rust` language.
+A windows desktop M3U8 downloader developed using `Rust` language.
 
-Thank you to the robust `Rust` ecosystem: `slint`, `tokio`, `futures`, `reqwest`, and more!
+Thank the powerful `Rust` ecosystem.: `slint`, `tokio`, `futures`, `reqwest`, and more!
 
 ## Main functions
 
 - [x] Asynchronous concurrent download
 - [x] Automatically select the highest resolution
 - [x] Customize concurrency, retry count, and connection timeout
-- [x] Display download progress in real-time (total number of slices, number of downloaded slices, and size)
-- [x] Support for suspension and cancellation
+- [x] Display download progress in real-time
+- [x] Support for pause and cancel
 - [x] Can be merged into MP4 (requires installation of `FFmpeg`)
 - [x] After merging, the segments can be deleted
 - [x] Support Chinese/English (adaptive according to system locale)
