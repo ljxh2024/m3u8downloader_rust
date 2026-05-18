@@ -350,7 +350,7 @@ impl DownloadManager {
         save_path: &Path,
         client: Arc<Client>,
         concurrency: usize,
-        retry: u32, // 重试次数
+        max_retries: u32,
         tx: mpsc::Sender<ChannelMessage>,
     ) {
         futures::stream::iter(segments)
@@ -363,7 +363,7 @@ impl DownloadManager {
                         return;
                     }
 
-                    self.download_single_segment(client, save_path, segment, tx_clone, retry)
+                    self.download_single_segment(client, save_path, segment, tx_clone, max_retries)
                         .await;
                 }
             })
@@ -377,67 +377,74 @@ impl DownloadManager {
         save_path: &Path,
         segment: Segment,
         tx: mpsc::Sender<ChannelMessage>,
-        retry: u32, // 重试次数
+        max_retries: u32,
     ) {
-        let mut is_finish = false;
-
-        for attempt in 0..retry {
-            if let Ok(resp) = client.get(&segment.download_url).send().await
-                && resp.status().is_success()
-                && let Ok(file) = File::create(save_path.join(&segment.name)).await
+        for attempt in 0..max_retries {
+            match self
+                .try_download_segment(&client, save_path, &segment)
+                .await
             {
-                let mut ok = true;
-                let mut writer = BufWriter::new(file);
-                let mut stream = resp.bytes_stream();
-                let mut segment_size = 0usize;
-
-                // 使用流式写入
-                while let Some(item) = stream.next().await {
-                    match item {
-                        Ok(chunk) => {
-                            if writer.write_all(&chunk).await.is_err() {
-                                ok = false;
-                                break;
-                            }
-                            segment_size += chunk.len();
-                        }
-                        Err(_) => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-
-                // 记录下载成功的分片
-                if writer.flush().await.is_ok() && ok {
+                Ok(segment_size) => {
+                    // 记录下载成功的分片
                     self.downloaded_segments.insert(segment.name.clone());
+                    // 更新下载数
                     let downloaded_nums = self.downloaded_nums.fetch_add(1, Ordering::Relaxed) + 1;
+                    // 更新文件总大小
                     let downloaded_sizes = self
                         .downloaded_sizes
                         .fetch_add(segment_size, Ordering::Relaxed)
                         + segment_size;
+                    // UI进度
                     let _ = tx
                         .send(ChannelMessage::Progress {
                             downloaded_nums,
                             downloaded_sizes,
                         })
                         .await;
-                    is_finish = true;
-                    break;
-                }
-            }
 
-            // 重试，使用指数退避策略
-            if attempt < retry {
-                let delay = 1000 * 2u64.pow(attempt);
-                sleep(Duration::from_millis(delay)).await;
+                    return;
+                }
+                Err(_) if attempt < max_retries - 1 => {
+                    let delay = Duration::from_secs(2 * 2u64.pow(attempt));
+                    sleep(delay).await;
+                }
+                Err(_) => break,
             }
         }
 
         // 记录下载失败的切片，任务结束后再写入文件
-        if !is_finish {
-            self.failed_segments.lock().await.push(segment);
+        self.failed_segments.lock().await.push(segment);
+    }
+
+    /// 下载分片+流式写入+记录成功 or 失败
+    ///
+    /// # Returns
+    /// * `Result<usize, Box<dyn Error>>` 文件大小
+    async fn try_download_segment(
+        &self,
+        client: &Client,
+        save_path: &Path,
+        segment: &Segment,
+    ) -> Result<usize, Box<dyn Error>> {
+        let resp = client
+            .get(&segment.download_url)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let file = File::create(save_path.join(&segment.name)).await?;
+        let mut writer = BufWriter::new(file);
+        let mut stream = resp.bytes_stream();
+        let mut total_size = 0usize;
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            writer.write_all(&chunk).await?;
+            total_size += chunk.len();
         }
+
+        writer.flush().await?;
+        Ok(total_size)
     }
 
     async fn parse_m3u8(
