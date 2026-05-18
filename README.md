@@ -1,22 +1,25 @@
+[English](./README.md) | [简体中文](./README_zh.md)
+
 # M3U8Downloader
-使用 `Rust` 语言开发的 `Windows` 桌面端**M3U8**视频下载器。
 
-感谢强大的 `Rust` 生态：`slint`、`tokio`、`futures`、`reqwest`等！
+A **M3U8** video downloader for the `Windows` desktop developed in the `Rust` language.
 
-## 主要功能
+Thank you to the robust `Rust` ecosystem: `slint`, `tokio`, `futures`, `reqwest`, and more!
 
-- [x] 异步并发下载
-- [x] 自动选择最高分辨率
-- [x] 自定义并发数、重试次数和连接超时
-- [x] 实时显示下载进度（总分片数、已下载分片数和大小）
-- [x] 支持暂停和取消
-- [x] 可合并为MP4（需要安装 `FFmpeg`）
-- [x] 合并后可删除分片
-- [x] 支持中文/英文（根据系统区域自适应）
-- [x] 浅色/暗黑主题自适应
-- [ ] 支持默认设置，如请求头、代理模式等。
+## Main functions
 
-## 截图
+- [x] Asynchronous concurrent download
+- [x] Automatically select the highest resolution
+- [x] Customize concurrency, retry count, and connection timeout
+- [x] Display download progress in real-time (total number of slices, number of downloaded slices, and size)
+- [x] Support for suspension and cancellation
+- [x] Can be merged into MP4 (requires installation of `FFmpeg`)
+- [x] After merging, the segments can be deleted
+- [x] Support Chinese/English (adaptive according to system locale)
+- [x] Light/Dark Theme Adaptation
+- [ ] Support default settings, such as request headers, proxy mode, etc.
+
+## Screenshots
 
 <div style="display: flex; gap: 10px;">
   <img src="screenshots/light.png" alt="light" style="width: 300px;">
