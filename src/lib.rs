@@ -1,9 +1,9 @@
 pub mod downloader;
 
 use downloader::{ChannelMessage, DownloadConfig, DownloadManager, DownloadState};
+use slint::PhysicalPosition;
 use std::{error::Error, sync::Arc};
 use tokio::sync::mpsc;
-use slint::PhysicalPosition;
 use winsafe::{GetSystemMetrics, co::SM};
 
 slint::include_modules!();
@@ -20,7 +20,9 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // 控制窗口位置
     let x = (GetSystemMetrics(SM::CXSCREEN) - 380) / 2;
     let y = (GetSystemMetrics(SM::CYSCREEN) - 600) / 2; // 尽量偏高
-    window.window().set_position(slint::WindowPosition::Physical(PhysicalPosition { x, y }));
+    window
+        .window()
+        .set_position(slint::WindowPosition::Physical(PhysicalPosition { x, y }));
 
     // UI界面默认语言，注释掉则自动根据系统区域设置，当前支持：中文/英文
     // let _ = slint::select_bundled_translation("en");
@@ -176,6 +178,13 @@ async fn consume_channel_message(
                 update_ui(&ui_weak, move |ui| {
                     ui.set_downloaded_sizes(format_size(downloaded_sizes).into());
                     ui.set_downloaded_nums(downloaded_nums as i32);
+                    ui.invoke_show_message("Downloading...".into(), false);
+                });
+            }
+            // 重试
+            ChannelMessage::Retry => {
+                update_ui(&ui_weak, |ui| {
+                    ui.invoke_show_message("Retrying download...".into(), true);
                 });
             }
             // 任务暂停成功

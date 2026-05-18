@@ -64,6 +64,7 @@ pub enum ChannelMessage {
         downloaded_nums: u32,    // 已下载的分片数
         downloaded_sizes: usize, // 已下载的大小
     },
+    Retry,
     Downloaded {
         message: String,           // 消息
         have_failed_segment: bool, // 是否有下载失败的分片
@@ -205,30 +206,17 @@ impl DownloadManager {
 
         // 并发数
         let concurrency = config.concurrency.min(segments_len);
-        let tx_clone_for_download = tx.clone();
 
-        // 并发下载
-        futures::stream::iter(segments)
-            .for_each_concurrent(concurrency, move |segment| {
-                let client = Arc::clone(&client);
-                let tx_clone_for_download = tx_clone_for_download.clone();
-
-                async move {
-                    if !self.is_downloading().await {
-                        return;
-                    }
-
-                    self.download_single_segment(
-                        client,
-                        save_path,
-                        segment,
-                        config.retry,
-                        tx_clone_for_download,
-                    )
-                    .await;
-                }
-            })
-            .await;
+        // 并发下载，第一次不重试，全部下载后若有下载失败的，再决定是否再集中重试
+        self.future_download(
+            segments,
+            save_path,
+            Arc::clone(&client),
+            concurrency,
+            1,
+            tx.clone(),
+        )
+        .await;
 
         // 任务因暂停而提前结束，但可能还继续下载
         if self.is_paused().await {
@@ -246,9 +234,7 @@ impl DownloadManager {
             // 清除下载失败的分片，重试时重新下载
             self.failed_segments.lock().await.clear();
 
-            let _ = tx
-                .send(ChannelMessage::Paused)
-                .await;
+            let _ = tx.send(ChannelMessage::Paused).await;
             return Ok(());
         }
 
@@ -260,8 +246,29 @@ impl DownloadManager {
         }
 
         // 任务正常结束
+
+        // 重试
+        let failed_segments = {
+            let mut guard = self.failed_segments.lock().await;
+            let clone = guard.clone();
+            guard.clear();
+            clone
+        };
+        if !failed_segments.is_empty() && config.retry > 0 {
+            let _ = tx.send(ChannelMessage::Retry).await;
+            self.future_download(
+                failed_segments,
+                save_path,
+                client,
+                concurrency,
+                config.retry,
+                tx.clone(),
+            )
+            .await;
+        }
+
         // 构建最终消息
-        let mut final_msg = String::from("Successfully downloaded all segments.");
+        let mut final_msg = String::from("Successfully downloaded!");
 
         let failed_nums = self.failed_segments.lock().await.len();
         if failed_nums > 0 {
@@ -336,14 +343,41 @@ impl DownloadManager {
         Ok(())
     }
 
-    /// 下载分片
+    /// 使用 futures::stream 并发下载
+    async fn future_download(
+        &self,
+        segments: Vec<Segment>,
+        save_path: &Path,
+        client: Arc<Client>,
+        concurrency: usize,
+        retry: u32, // 重试次数
+        tx: mpsc::Sender<ChannelMessage>,
+    ) {
+        futures::stream::iter(segments)
+            .for_each_concurrent(concurrency, move |segment| {
+                let client = Arc::clone(&client);
+                let tx_clone = tx.clone();
+
+                async move {
+                    if !self.is_downloading().await {
+                        return;
+                    }
+
+                    self.download_single_segment(client, save_path, segment, tx_clone, retry)
+                        .await;
+                }
+            })
+            .await;
+    }
+
+    /// 下载单个分片
     async fn download_single_segment(
         &self,
         client: Arc<Client>,
         save_path: &Path,
         segment: Segment,
-        retry: u32,
         tx: mpsc::Sender<ChannelMessage>,
+        retry: u32, // 重试次数
     ) {
         let mut is_finish = false;
 
@@ -394,8 +428,8 @@ impl DownloadManager {
             }
 
             // 重试，使用指数退避策略
-            if attempt < retry - 1 {
-                let delay = 200 * 2u64.pow(attempt);
+            if attempt < retry {
+                let delay = 1000 * 2u64.pow(attempt);
                 sleep(Duration::from_millis(delay)).await;
             }
         }
@@ -501,7 +535,7 @@ impl DownloadConfig {
             m3u8_url,
             concurrency,
             connect_timeout,
-            retry: ui.get_retry().parse().unwrap_or(3) + 1, // 重试次数加 1 确保执行一次
+            retry: ui.get_retry().parse().unwrap_or(3),
             is_merge: ui.get_is_merge(),
             is_delete_segment: ui.get_is_delete_segment(),
         })
