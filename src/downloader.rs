@@ -41,13 +41,23 @@ const FAILED_FILENAME: &str = "failed.txt";
 static MASTER_RE: Lazy<regex::Regex> = Lazy::new(|| Regex::new(r"RESOLUTION=(\d+)x(\d+)").unwrap());
 // 过滤视频名称
 static VIDEO_NAME_RE: Lazy<regex::Regex> = Lazy::new(|| Regex::new(r#"[<>:"/\\|?*]"#).unwrap());
+// 匹配 image MIME
+static IMAGE_MIME_RE: Lazy<regex::Regex> =
+    Lazy::new(|| Regex::new(r#"image/(jpg|jpeg|png|gif|webp|bmp|svg)"#).unwrap());
 
 /// 下载状态
 #[derive(Debug, Clone, PartialEq, Copy)]
 pub enum DownloadState {
+    /// 空闲
     Idle,
+
+    /// 下载中
     Downloading,
+
+    /// 已暂停
     Paused,
+
+    /// 已取消
     Canceled,
 }
 
@@ -75,7 +85,10 @@ pub enum ChannelMessage {
 /// 分片信息
 #[derive(Debug, Clone)]
 pub struct Segment {
+    /// 分片名称
     name: String,
+
+    /// 下载绝对地址
     download_url: String,
 }
 
@@ -174,26 +187,14 @@ impl DownloadManager {
 
         // 新下载任务
         // 待下载的分片、保存路径
-        let (segments, path_buf) = if self.is_idle().await {
-            let save_path = Path::new(&config.save_path);
-            let segments = self
-                .parse_m3u8(&config.m3u8_url, Arc::clone(&client), save_path)
+        if self.is_idle().await {
+            self.parse_m3u8(&config.m3u8_url, Arc::clone(&client), &config.save_path)
                 .await?;
+        }
 
-            self.segments.lock().await.clone_from(&segments);
-            self.save_path.lock().await.clone_from(&config.save_path);
-
-            (segments, config.save_path)
-        } else {
-            // 继续下载
-            (
-                self.segments.lock().await.clone(),
-                self.save_path.lock().await.clone(),
-            )
-        };
-
+        let segments = self.segments.lock().await.clone();
         let segments_len = segments.len();
-        let save_path = Path::new(&path_buf);
+        let save_path = self.save_path.lock().await.clone();
 
         tx.send(ChannelMessage::Start {
             total_nums: segments_len,
@@ -210,7 +211,7 @@ impl DownloadManager {
         // 并发下载，第一次不重试，全部下载后若有下载失败的，再决定是否再集中重试
         self.future_download(
             segments,
-            save_path,
+            &save_path,
             Arc::clone(&client),
             concurrency,
             1,
@@ -258,7 +259,7 @@ impl DownloadManager {
             let _ = tx.send(ChannelMessage::Retry).await;
             self.future_download(
                 failed_segments,
-                save_path,
+                &save_path,
                 client,
                 concurrency,
                 config.retry,
@@ -293,16 +294,8 @@ impl DownloadManager {
                     .to_string_lossy()
                     .to_string();
                 // 构建合并参数
-                let args = vec![
-                    "-allowed_extensions",
-                    "ALL",
-                    "-i",
-                    &m3u8_path,
-                    "-c",
-                    "copy",
-                    "-y",
-                    &mp4_path,
-                ];
+                // :todo 待优化
+                let args = vec!["-i", &m3u8_path, "-c", "copy", "-y", &mp4_path];
                 let downloaded_segments = self
                     .downloaded_segments
                     .iter()
@@ -313,7 +306,7 @@ impl DownloadManager {
                     args,
                     config.is_delete_segment,
                     downloaded_segments,
-                    save_path,
+                    &save_path,
                 )
                 .await
                 {
@@ -452,7 +445,7 @@ impl DownloadManager {
         m3u8_url: &str,
         client: Arc<Client>,
         save_path: &Path,
-    ) -> Result<Vec<Segment>, Box<dyn Error>> {
+    ) -> Result<(), Box<dyn Error>> {
         let mut base_url = Url::parse(m3u8_url)?.join(".")?;
         let mut content = fetch_m3u8_content(&client, m3u8_url).await?;
 
@@ -479,7 +472,14 @@ impl DownloadManager {
             return Err("No segments found.".into());
         }
 
-        Ok(segments)
+        self.segments.lock().await.clone_from(&segments);
+
+        self.save_path
+            .lock()
+            .await
+            .clone_from(&save_path.to_path_buf());
+
+        Ok(())
     }
 }
 
@@ -492,8 +492,6 @@ impl Default for DownloadManager {
 /// 用户下载配置
 #[derive(Debug)]
 pub struct DownloadConfig {
-    //pub save_path: PathBuf, // 保存目录将保存至 DownloadTask
-    //pub connect_timeout: u64,
     save_path: PathBuf,
     video_name: String,
     m3u8_url: String,
@@ -662,15 +660,14 @@ async fn extract_suffix_from_m3u8_content(
     for line in content.lines() {
         if !line.starts_with("#") {
             let download_url = build_abs_url(base_url, line)?.to_string();
-            let resp = client.head(download_url).send().await?;
-            if resp.status().is_success()
-                && let Some(v) = resp
-                    .headers()
-                    .get(CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                && let Some(suffix) = v.split("/").collect::<Vec<&str>>().last()
-                && *suffix != "mp2t"
-            {
+            let resp = client.head(download_url).send().await?.error_for_status()?;
+            let content_type = resp
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("unknown");
+            if let Some(caps) = IMAGE_MIME_RE.captures(content_type) {
+                let suffix = caps.get(1).map(|m| m.as_str()).unwrap_or("ts");
                 return Ok(format!(".{}", suffix));
             }
             break;
@@ -772,6 +769,7 @@ async fn merge_and_delete(
         // 删除 m3u8 文件
         let _ = fs::remove_file(save_path.join(M3U8_FILENAME)).await;
         // 已删除文件数
+        // :todo 待优化
         let deleted_counter = Arc::new(AtomicU32::new(0));
 
         futures::stream::iter(downloaded_segments)

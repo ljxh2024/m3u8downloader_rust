@@ -154,80 +154,60 @@ async fn consume_channel_message(
     ui_weak: slint::Weak<AppWindow>,
     rx: &mut mpsc::Receiver<ChannelMessage>,
 ) {
+    let ui = ui_weak.unwrap();
+
     while let Some(item) = rx.recv().await {
         match item {
             ChannelMessage::Start {
                 total_nums,
                 is_new_download,
             } => {
-                update_ui(&ui_weak, move |ui| {
-                    ui.invoke_show_message("Downloading...".into(), false);
-                    ui.set_enable_pause_btn(true);
-                    ui.set_enable_cancel_btn(true);
+                ui.invoke_show_message("Downloading...".into(), false);
+                ui.set_enable_pause_btn(true);
+                ui.set_enable_cancel_btn(true);
 
-                    if is_new_download {
-                        ui.set_total_nums(total_nums as i32);
-                    }
-                });
+                if is_new_download {
+                    ui.set_total_nums(total_nums as i32);
+                }
             }
             // 实时更新下载进度
             ChannelMessage::Progress {
                 downloaded_nums,
                 downloaded_sizes,
             } => {
-                update_ui(&ui_weak, move |ui| {
-                    ui.set_downloaded_sizes(format_size(downloaded_sizes).into());
-                    ui.set_downloaded_nums(downloaded_nums as i32);
-                    ui.invoke_show_message("Downloading...".into(), false);
-                });
+                ui.set_downloaded_sizes(format_size(downloaded_sizes).into());
+                ui.set_downloaded_nums(downloaded_nums as i32);
+                ui.invoke_show_message("Downloading...".into(), false);
             }
             // 重试
             ChannelMessage::Retry => {
-                update_ui(&ui_weak, |ui| {
-                    ui.invoke_show_message("Retrying download...".into(), true);
-                });
+                ui.invoke_show_message("Retrying download...".into(), true);
             }
             // 任务暂停成功
             ChannelMessage::Paused => {
-                update_ui(&ui_weak, move |ui| {
-                    ui.set_enable_start_btn(true);
-                    ui.set_enable_cancel_btn(true);
-                    ui.set_download_state(DownloadState::Paused as i32);
-                    ui.invoke_show_message("You paused the download.".into(), false);
-                });
+                ui.set_enable_start_btn(true);
+                ui.set_enable_cancel_btn(true);
+                ui.set_download_state(DownloadState::Paused as i32);
+                ui.invoke_show_message("You paused the download.".into(), false);
             }
             // 任务取消成功（非暂停状态下的取消）
             ChannelMessage::Canceled => {
-                update_ui(&ui_weak, |ui| {
-                    ui.invoke_task_finished("You canceled the download.".into(), true);
-                });
+                ui.invoke_task_finished("You canceled the download.".into(), true);
             }
             // 下载完毕
             ChannelMessage::Downloaded {
                 message,
                 have_failed_segment,
             } => {
-                update_ui(&ui_weak, move |ui| {
-                    ui.invoke_task_finished(message.into(), false);
-                    ui.set_have_failed_segment(have_failed_segment);
-                });
+                ui.invoke_task_finished(message.into(), false);
+                ui.set_have_failed_segment(have_failed_segment);
             }
             // 合并分片
             ChannelMessage::Merging => {
-                update_ui(&ui_weak, |ui| {
-                    ui.invoke_show_message("Merging segments into MP4...".into(), false);
-                });
+                ui.invoke_show_message("Merging segments into MP4...".into(), false);
             }
         }
     }
-}
-
-/// 简化UI更新代码量
-fn update_ui<F>(ui_weak: &slint::Weak<AppWindow>, f: F)
-where
-    F: FnOnce(AppWindow) + Send + 'static,
-{
-    ui_weak.upgrade_in_event_loop(f).unwrap();
 }
 
 /// 解析M3U8,下载分片

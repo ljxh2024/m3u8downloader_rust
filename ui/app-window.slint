@@ -7,7 +7,7 @@ import {
     CheckBox,
     Palette
 } from "std-widgets.slint";
-import { InputTxt } from "input-txt.slint";
+import { RequiredInput } from "common.slint";
 
 export component AppWindow inherits Window {
     title: "M3U8Downloader_rust";
@@ -61,12 +61,6 @@ export component AppWindow inherits Window {
     // 取消下载
     callback cancel-download();
 
-    // 任务下载中的界面状态
-    // callback task-downloading();
-    // 任务成功暂停后的界面状态
-    // callback task-paused();
-    // 任务取消成功后的界面状态
-    // callback task-canceled();
     // 任务结束后的状态，arg_0:消息文本 arg_1:是否是取消导致的任务结束
     callback task-finished(string, bool);
 
@@ -119,7 +113,7 @@ export component AppWindow inherits Window {
                     spacing: 6px;
                     // 工作目录
                     Row {
-                        InputTxt { name: @tr("Download directory"); }
+                        RequiredInput { name: @tr("Download directory"); }
                         LineEdit {
                             text <=> root.work-dir;
                             read-only: true;
@@ -133,7 +127,7 @@ export component AppWindow inherits Window {
                     }
                     // 视频名称
                     Row {
-                        InputTxt { name: @tr("Video name"); }
+                        RequiredInput { name: @tr("Video name"); }
                         LineEdit {
                             text <=> root.video-name;
                             colspan: 2;
@@ -142,7 +136,7 @@ export component AppWindow inherits Window {
                     }
                     // M3U8 URL
                     Row {
-                        InputTxt { name: @tr("M3U8 URL"); }
+                        RequiredInput { name: @tr("M3U8 URL"); }
                         LineEdit {
                             text <=> root.m3u8-url;
                             colspan: 2;
@@ -273,19 +267,19 @@ export component AppWindow inherits Window {
             title: @tr("About");
             Rectangle {
                 Text {
-                    y: 140px;
+                    y: 150px;
                     text: "M3U8Downloader_rust";
                 }
                 Text {
-                    y: 160px;
-                    text: "Version 0.1.3";
+                    y: 170px;
+                    text: "Version 0.1.4";
                 }
                 Text {
-                    y: 180px;
+                    y: 190px;
                     text: "Github:";
                 }
                 Text {
-                    y: 200px;
+                    y: 210px;
                     text: root.github;
                     color: #007fff;
                     TouchArea {
