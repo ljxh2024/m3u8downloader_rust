@@ -27,7 +27,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // UI界面默认语言，注释掉则自动根据系统区域设置，当前支持：中文/英文
     // let _ = slint::select_bundled_translation("en");
     // 全局下载管理
-    let download_manager = Rc::new(DownloadManager::new());
+    let download_manager = Rc::new(DownloadManager::builder());
     // 使用信道通信
     // let (tx, mut rx) = mpsc::channel(CHANNEL_BUFFER_CAPACITY);
     let (tx, rx) = channel::bounded(CHANNEL_BUFFER_CAPACITY);

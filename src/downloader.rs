@@ -29,8 +29,6 @@ static MASTER_RE: Lazy<regex::Regex> = Lazy::new(|| Regex::new(r"RESOLUTION=(\d+
 static IMAGE_MIME_RE: Lazy<regex::Regex> =
     Lazy::new(|| Regex::new(r#"image/(jpg|jpeg|png|gif|webp|bmp|svg)"#).unwrap());
 
-// 视频名称最大长度
-const MAX_VIDEO_NAME_LEN: usize = 50;
 // :todo USER-AGENT，后期引入请求头后改为自定义
 const APP_USER_AGENT: &str = "Chrome/147";
 // M3U8文件名
@@ -38,7 +36,7 @@ const M3U8_FILENAME: &str = "index.m3u8";
 // 下载失败的文件名
 const FAILED_FILENAME: &str = "failed.txt";
 // 删除分片最大并发数
-const DELETE_CONCURRENCY: usize = 20;
+const DELETE_CONCURRENCY: usize = 15;
 
 /// 下载状态
 #[derive(Debug, Clone, PartialEq, Copy)]
@@ -128,6 +126,8 @@ pub struct UserConfig {
 
 impl UserConfig {
     /// 创建下载配置
+    ///
+    /// 新下载任务时验证部分配置
     pub async fn new(
         ui: &AppWindow,
         download_manager: &Rc<DownloadManager>,
@@ -199,15 +199,9 @@ pub struct DownloadManager {
     downloaded_sizes: Cell<usize>,
 }
 
-impl Default for DownloadManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl DownloadManager {
     /// 创建一个 DownloadManager
-    pub fn new() -> Self {
+    pub fn builder() -> Self {
         Self {
             download_state: Cell::new(DownloadState::Idle),
             all_segments: RefCell::new(Vec::new()),
@@ -271,7 +265,7 @@ impl DownloadManager {
         self.download_state.get() == DownloadState::Paused
     }
 
-    /// 任务是否情取消
+    /// 任务是否取消
     fn is_canceled(&self) -> bool {
         self.download_state.get() == DownloadState::Canceled
     }
@@ -289,6 +283,7 @@ impl DownloadManager {
                 .build()?,
         );
 
+        // 待下载分片、保存目录、原分片总数
         let (segments, save_path, segments_len) = if self.is_idle() {
             let all_segments = self
                 .parse_m3u8(&client, &user_config.m3u8_url, &user_config.save_path)
@@ -324,8 +319,9 @@ impl DownloadManager {
 
         self.set_download_state(DownloadState::Downloading);
 
-        // 并发下载
+        // 并发限制
         let concurrency = user_config.concurrency.min(segments_len);
+        // 异步并发下载
         self.future_download(
             segments,
             &save_path,
@@ -579,9 +575,8 @@ impl DownloadManager {
                 .await;
             let _ = file.flush().await;
         }
-        self.failed_segments.borrow_mut().push(segment);
 
-        // self.failed_segments.lock().await.push(segment);
+        self.failed_segments.borrow_mut().push(segment);
     }
 
     /// 下载分片+流式写入+记录成功 or 失败
@@ -632,14 +627,7 @@ async fn create_safe_save_path(
         .unwrap_or(video_name);
 
     // 移除非法字符
-    let cleaned = VIDEO_NAME_RE.replace_all(safe_name, "_");
-    // 对 UTF-8 做字符级截断，避免截断到半个字符
-    let mut clean_name: String = cleaned.chars().collect();
-
-    // 限制视频名称长度
-    if clean_name.chars().count() > MAX_VIDEO_NAME_LEN {
-        clean_name = clean_name.chars().take(MAX_VIDEO_NAME_LEN).collect();
-    }
+    let clean_name = VIDEO_NAME_RE.replace_all(safe_name, "_").to_string();
 
     // 创建保存目录
     let save_path = Path::new(work_dir).join(&clean_name);
