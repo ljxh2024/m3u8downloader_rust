@@ -307,7 +307,7 @@ impl DownloadManager {
                 .cloned()
                 .collect();
 
-            (wait_download_segments, self.save_path.borrow().clone(), 0)
+            (wait_download_segments, self.save_path.borrow().clone(), all_segments.len())
         };
 
         let _ = tx
@@ -321,6 +321,7 @@ impl DownloadManager {
 
         // 并发限制
         let concurrency = user_config.concurrency.min(segments_len);
+
         // 异步并发下载
         self.future_download(
             segments,
