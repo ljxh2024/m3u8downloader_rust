@@ -2,9 +2,9 @@
 
 # M3U8Downloader_rust
 
-A windows desktop M3U8 downloader developed using `Rust` language.
+Based on asynchronous single-threaded design, a windows desktop M3U8 downloader developed using `Rust` language.
 
-Thank the powerful `Rust` ecosystem.: `slint`, `tokio`, `futures`, `reqwest`, and more!
+Thank the powerful `Rust` ecosystem.: `slint`, `smol`, `futures`, `reqwest`, and more!
 
 ## Main functions
 

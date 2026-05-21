@@ -1,15 +1,15 @@
 pub mod downloader;
 
-use downloader::{ChannelMessage, DownloadConfig, DownloadManager, DownloadState};
+use downloader::{ChannelMessage, DownloadManager, DownloadState, UserConfig};
 use slint::PhysicalPosition;
-use std::{error::Error, sync::Arc};
-use tokio::sync::mpsc;
+use smol::channel;
+use std::{error::Error, rc::Rc};
 use winsafe::{GetSystemMetrics, co::SM};
 
 slint::include_modules!();
 
 // 信道缓冲区容量
-const CHANNEL_BUFFER_CAPACITY: usize = 100;
+const CHANNEL_BUFFER_CAPACITY: usize = 50;
 // 下载失败的文件名
 const FAILED_FILENAME: &str = "failed.txt";
 
@@ -27,37 +27,36 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // UI界面默认语言，注释掉则自动根据系统区域设置，当前支持：中文/英文
     // let _ = slint::select_bundled_translation("en");
     // 全局下载管理
-    let download_manager = Arc::new(DownloadManager::new());
+    let download_manager = Rc::new(DownloadManager::new());
     // 使用信道通信
-    let (tx, mut rx) = mpsc::channel(CHANNEL_BUFFER_CAPACITY);
+    // let (tx, mut rx) = mpsc::channel(CHANNEL_BUFFER_CAPACITY);
+    let (tx, rx) = channel::bounded(CHANNEL_BUFFER_CAPACITY);
 
     // 启动异步任务处理信道消息并维护UI
     let ui_weak_channel = window.as_weak();
     slint::spawn_local(async move {
-        consume_channel_message(ui_weak_channel, &mut rx).await;
+        consume_channel_message(ui_weak_channel, rx).await;
     })
     .unwrap();
 
     // 启动下载
     window.on_start_download({
         let ui_weak = window.as_weak();
-        let download_manager_clone = Arc::clone(&download_manager);
+        let download_manager_clone = Rc::clone(&download_manager);
         let tx_clone = tx.clone();
 
         move || {
             let ui = ui_weak.unwrap();
-            let download_manager_clone = Arc::clone(&download_manager_clone);
+            let download_manager_clone = Rc::clone(&download_manager_clone);
             let tx_clone = tx_clone.clone();
 
             slint::spawn_local(async_compat::Compat::new(async move {
                 // 处理下载期间的错误
-                if let Err(e) =
-                    parse_download(&ui, Arc::clone(&download_manager_clone), tx_clone).await
-                {
+                if let Err(e) = parse_download(&ui, &download_manager_clone, tx_clone).await {
                     ui.invoke_show_message(e.to_string().into(), true);
                     ui.set_enable_start_btn(true);
                     // 使用全局的下载状态重新赋值
-                    ui.set_download_state(download_manager_clone.get_download_state().await as i32);
+                    ui.set_download_state(download_manager_clone.get_download_state() as i32);
                 }
             }))
             .unwrap();
@@ -67,7 +66,7 @@ pub fn run() -> Result<(), slint::PlatformError> {
     // 暂停
     window.on_pause_download({
         let ui_weak = window.as_weak();
-        let download_manager_clone = Arc::clone(&download_manager);
+        let download_manager_clone = Rc::clone(&download_manager);
 
         move || {
             let ui = ui_weak.unwrap();
@@ -75,20 +74,14 @@ pub fn run() -> Result<(), slint::PlatformError> {
             ui.set_enable_pause_btn(false);
             ui.invoke_show_message("Pausing...".into(), false);
 
-            let download_manager_clone = Arc::clone(&download_manager_clone);
-            slint::spawn_local(async move {
-                download_manager_clone
-                    .set_download_state(DownloadState::Paused)
-                    .await;
-            })
-            .unwrap();
+            download_manager_clone.set_download_state(DownloadState::Paused);
         }
     });
 
     // 取消
     window.on_cancel_download({
         let ui_weak = window.as_weak();
-        let download_manager_clone = Arc::clone(&download_manager);
+        let download_manager_clone = Rc::clone(&download_manager);
 
         move || {
             let ui = ui_weak.unwrap();
@@ -98,19 +91,11 @@ pub fn run() -> Result<(), slint::PlatformError> {
             ui.set_enable_cancel_btn(false);
             ui.invoke_show_message("Canceling...".into(), false);
 
-            let download_manager_clone = Arc::clone(&download_manager_clone);
-            slint::spawn_local(async move {
-                let old_state = download_manager_clone
-                    .update_download_state(DownloadState::Canceled)
-                    .await;
-                if old_state == DownloadState::Paused {
-                    ui.invoke_task_finished("You canceled the download.".into(), true);
-
-                    // 重置任务
-                    download_manager_clone.clear().await;
-                }
-            })
-            .unwrap();
+            let old_state = download_manager_clone.update_download_state(DownloadState::Canceled);
+            if old_state == DownloadState::Paused {
+                ui.invoke_task_finished("You canceled the download.".into(), true);
+                download_manager_clone.clear();
+            }
         }
     });
 
@@ -129,20 +114,12 @@ pub fn run() -> Result<(), slint::PlatformError> {
 
     // 打开下载失败的文件
     window.on_open_failed_file({
-        let download_manager_clone = Arc::clone(&download_manager);
+        let download_manager_clone = Rc::clone(&download_manager);
         move || {
-            let download_manager_clone = Arc::clone(&download_manager_clone);
-            slint::spawn_local(async move {
-                let file_path = download_manager_clone
-                    .save_path
-                    .lock()
-                    .await
-                    .join(FAILED_FILENAME);
-                if file_path.exists() {
-                    let _ = open::that(file_path);
-                }
-            })
-            .unwrap();
+            let file_path = download_manager_clone.get_save_path().join(FAILED_FILENAME);
+            if file_path.exists() {
+                let _ = open::that(file_path);
+            }
         }
     });
 
@@ -152,11 +129,11 @@ pub fn run() -> Result<(), slint::PlatformError> {
 /// 处理信道消息并维护UI
 async fn consume_channel_message(
     ui_weak: slint::Weak<AppWindow>,
-    rx: &mut mpsc::Receiver<ChannelMessage>,
+    rx: channel::Receiver<ChannelMessage>,
 ) {
     let ui = ui_weak.unwrap();
 
-    while let Some(item) = rx.recv().await {
+    while let Ok(item) = rx.recv().await {
         match item {
             ChannelMessage::Start {
                 total_nums,
@@ -178,10 +155,6 @@ async fn consume_channel_message(
                 ui.set_downloaded_sizes(format_size(downloaded_sizes).into());
                 ui.set_downloaded_nums(downloaded_nums as i32);
                 ui.invoke_show_message("Downloading...".into(), false);
-            }
-            // 重试
-            ChannelMessage::Retry => {
-                ui.invoke_show_message("Retrying download...".into(), true);
             }
             // 任务暂停成功
             ChannelMessage::Paused => {
@@ -213,12 +186,11 @@ async fn consume_channel_message(
 /// 解析M3U8,下载分片
 async fn parse_download(
     ui: &AppWindow,
-    download_manager: Arc<DownloadManager>,
-    tx: mpsc::Sender<ChannelMessage>,
+    download_manager: &Rc<DownloadManager>,
+    tx: channel::Sender<ChannelMessage>,
 ) -> Result<(), Box<dyn Error>> {
-    download_manager
-        .download(DownloadConfig::new(ui, &download_manager).await?, tx)
-        .await
+    let user_config = UserConfig::new(ui, download_manager).await?;
+    download_manager.download(&user_config, tx).await
 }
 
 /// 格式化大小显示

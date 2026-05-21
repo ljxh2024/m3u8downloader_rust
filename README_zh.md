@@ -1,8 +1,6 @@
 # M3U8Downloader_rust
 
-使用 `Rust` 语言开发的 `Windows` 桌面端**M3U8**视频下载器。
-
-感谢强大的 `Rust` 生态：`slint`、`tokio`、`futures`、`reqwest`等！
+基于异步单线程设计，使用 `Rust` 语言开发的 `Windows` 桌面端**M3U8**视频下载器。
 
 ## 主要功能
 

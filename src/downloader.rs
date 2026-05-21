@@ -1,49 +1,44 @@
-//! # 下载管理
-//!
-//! `downloader` 主要管理M3U8的解析和下载
+//! # 异步单线程并发下载版本
 
 use crate::AppWindow;
-use dashmap::DashSet;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::{Client, header::CONTENT_TYPE};
 use slint::SharedString;
-use std::{
-    error::Error,
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU32, AtomicUsize, Ordering},
-    },
-};
-use tokio::{
+use smol::{
+    Timer, channel,
     fs::{self, File},
     io::{self, AsyncWriteExt, BufWriter},
-    process::Command,
-    sync::{Mutex, RwLock, mpsc},
-    time::{Duration, sleep},
+    process::{Command, windows::CommandExt},
+};
+use std::{
+    cell::{Cell, Ref, RefCell},
+    error::Error,
+    path::{Path, PathBuf},
+    rc::Rc,
+    time::Duration,
 };
 use url::Url;
 
-// M3U8文件名
-const M3U8_FILENAME: &str = "index.m3u8";
-// 删除分片最大并发数
-const DELETE_CONCURRENCY: usize = 20;
+// 过滤视频名称
+static VIDEO_NAME_RE: Lazy<regex::Regex> = Lazy::new(|| Regex::new(r#"[<>:"/\\|?*]"#).unwrap());
+// 匹配大师列表
+static MASTER_RE: Lazy<regex::Regex> = Lazy::new(|| Regex::new(r"RESOLUTION=(\d+)x(\d+)").unwrap());
+// 匹配 image MIME
+static IMAGE_MIME_RE: Lazy<regex::Regex> =
+    Lazy::new(|| Regex::new(r#"image/(jpg|jpeg|png|gif|webp|bmp|svg)"#).unwrap());
+
 // 视频名称最大长度
 const MAX_VIDEO_NAME_LEN: usize = 50;
 // :todo USER-AGENT，后期引入请求头后改为自定义
 const APP_USER_AGENT: &str = "Chrome/147";
+// M3U8文件名
+const M3U8_FILENAME: &str = "index.m3u8";
 // 下载失败的文件名
 const FAILED_FILENAME: &str = "failed.txt";
-
-// 匹配大师列表
-static MASTER_RE: Lazy<regex::Regex> = Lazy::new(|| Regex::new(r"RESOLUTION=(\d+)x(\d+)").unwrap());
-// 过滤视频名称
-static VIDEO_NAME_RE: Lazy<regex::Regex> = Lazy::new(|| Regex::new(r#"[<>:"/\\|?*]"#).unwrap());
-// 匹配 image MIME
-static IMAGE_MIME_RE: Lazy<regex::Regex> =
-    Lazy::new(|| Regex::new(r#"image/(jpg|jpeg|png|gif|webp|bmp|svg)"#).unwrap());
+// 删除分片最大并发数
+const DELETE_CONCURRENCY: usize = 20;
 
 /// 下载状态
 #[derive(Debug, Clone, PartialEq, Copy)]
@@ -64,21 +59,32 @@ pub enum DownloadState {
 /// 信道消息
 #[derive(Debug)]
 pub enum ChannelMessage {
+    /// 解析完毕，开始下载
+    /// is_new_download == true => 更新 total_nums
     Start {
-        total_nums: usize, // 总分片数
+        total_nums: usize,
         is_new_download: bool,
     },
+
+    /// 暂停
     Paused,
+
+    /// 取消
     Canceled,
+
+    /// 下载进度
     Progress {
-        downloaded_nums: u32,    // 已下载的分片数
-        downloaded_sizes: usize, // 已下载的大小
+        downloaded_nums: u32,
+        downloaded_sizes: usize,
     },
-    Retry,
+
+    /// 下载完毕
     Downloaded {
-        message: String,           // 消息
-        have_failed_segment: bool, // 是否有下载失败的分片
+        message: String,
+        have_failed_segment: bool,
     },
+
+    /// 合并中
     Merging,
 }
 
@@ -92,223 +98,277 @@ pub struct Segment {
     download_url: String,
 }
 
-/// 下载管理
+/// 用户下载配置
+#[derive(Debug)]
+pub struct UserConfig {
+    /// 保存目录 下载目录+视频名称
+    save_path: PathBuf,
+
+    /// 视频名称
+    video_name: String,
+
+    /// M3U8地址
+    m3u8_url: String,
+
+    /// 并发数
+    concurrency: usize,
+
+    /// 重试次数
+    retry_count: u32,
+
+    /// 连接超时
+    connect_timeout: u64,
+
+    /// 是否合并分片
+    is_merge: bool,
+
+    /// 是否删除分片，前提是成功合并分片
+    is_delete_segment: bool,
+}
+
+impl UserConfig {
+    /// 创建下载配置
+    pub async fn new(
+        ui: &AppWindow,
+        download_manager: &Rc<DownloadManager>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let video_name = ui.get_video_name();
+
+        let (save_path, video_name, m3u8_url) = if download_manager.is_idle() {
+            let (save_path, video_name) =
+                create_safe_save_path(&ui.get_work_dir(), &video_name).await?;
+            let m3u8_url = ui.get_m3u8_url().to_string();
+
+            if Url::parse(&ui.get_m3u8_url()).is_err() {
+                return Err("Invalid M3U8 URL".into());
+            };
+
+            (save_path, video_name, m3u8_url)
+        } else {
+            (PathBuf::default(), video_name.into(), String::default())
+        };
+
+        let concurrency = ui.get_concurrency().parse::<usize>().unwrap_or(4);
+        if concurrency < 1 {
+            return Err("Concurrency cannot be less than 1".into());
+        }
+
+        let connect_timeout = ui.get_connect_timeout().parse::<u64>().unwrap_or(3);
+        if connect_timeout < 1 {
+            return Err("Connect timeout cannot be less than 1 second".into());
+        }
+
+        Ok(Self {
+            save_path,
+            video_name,
+            m3u8_url,
+            concurrency,
+            connect_timeout,
+            // 重试次数， + 1 确保至少执行一次
+            retry_count: ui.get_retry_count().parse().unwrap_or(3) + 1,
+            is_merge: ui.get_is_merge(),
+            is_delete_segment: ui.get_is_delete_segment(),
+        })
+    }
+}
+
+/// 任务下载管理
 #[derive(Debug)]
 pub struct DownloadManager {
-    download_state: RwLock<DownloadState>,
-    segments: Mutex<Vec<Segment>>,
-    // 已下载的分片，仅存储分片名称，高并发频繁写入，使用 DashSet 无锁结构
-    downloaded_segments: DashSet<String>,
-    // 下载失败的分片，任务完成后再写入文件，一般下载失败的概率很小，使用 Mutex 即可
-    failed_segments: Mutex<Vec<Segment>>,
-    pub save_path: Mutex<PathBuf>, // 保存路径
-    downloaded_nums: AtomicU32,
-    downloaded_sizes: AtomicUsize,
+    /// 下载状态
+    download_state: Cell<DownloadState>,
+
+    /// 总分片
+    all_segments: RefCell<Vec<Segment>>,
+
+    /// 已下载的分片，仅存储分片名称，可用以删除分片
+    downloaded_segments: RefCell<Vec<String>>,
+
+    /// 下载失败的分片
+    ///
+    /// 写入文件格式形如：{segment_name}.ts - {download_url}
+    failed_segments: RefCell<Vec<Segment>>,
+
+    /// 保存路径
+    save_path: RefCell<PathBuf>,
+
+    /// 已下载分片数
+    downloaded_nums: Cell<u32>,
+
+    /// 已下载的大小
+    downloaded_sizes: Cell<usize>,
+}
+
+impl Default for DownloadManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DownloadManager {
-    /// 创建新的下载任务
+    /// 创建一个 DownloadManager
     pub fn new() -> Self {
         Self {
-            download_state: RwLock::new(DownloadState::Idle),
-            segments: Mutex::new(Vec::new()),
-            downloaded_segments: DashSet::new(),
-            failed_segments: Mutex::new(Vec::new()),
-            save_path: Mutex::new(PathBuf::new()),
-            downloaded_nums: AtomicU32::new(0),
-            downloaded_sizes: AtomicUsize::new(0),
+            download_state: Cell::new(DownloadState::Idle),
+            all_segments: RefCell::new(Vec::new()),
+            downloaded_segments: RefCell::new(Vec::new()),
+            failed_segments: RefCell::new(Vec::new()),
+            save_path: RefCell::new(PathBuf::new()),
+            downloaded_nums: Cell::new(0),
+            downloaded_sizes: Cell::new(0),
         }
     }
 
-    /// 清空/恢复默认值
-    pub async fn clear(&self) {
-        // 没有下载失败的分片时才清除 save_path，否则不能打开失败的文件
-        if self.failed_segments.lock().await.is_empty() {
-            self.save_path.lock().await.clear();
+    /// 清除 DownloadManager 所有字段的值，恢复为默认
+    pub fn clear(&self) {
+        // 有下载失败时才保留 save_path 用以打开查看
+        if self.failed_segments.borrow().is_empty() {
+            self.save_path.borrow_mut().clear();
         }
 
-        *self.download_state.write().await = DownloadState::Idle;
-        self.segments.lock().await.clear();
-        self.downloaded_segments.clear();
-        self.failed_segments.lock().await.clear();
-        self.downloaded_nums.store(0, Ordering::Relaxed);
-        self.downloaded_sizes.store(0, Ordering::Relaxed);
+        self.download_state.set(DownloadState::Idle);
+        self.all_segments.borrow_mut().clear();
+        self.downloaded_segments.borrow_mut().clear();
+        self.failed_segments.borrow_mut().clear();
+        self.downloaded_nums.set(0);
+        self.downloaded_sizes.set(0);
     }
 
-    /// 获取下载状态
-    pub async fn get_download_state(&self) -> DownloadState {
-        *self.download_state.read().await
+    /// 获取 save_path
+    pub fn get_save_path(&self) -> Ref<'_, PathBuf> {
+        self.save_path.borrow()
     }
 
-    /// 是否空闲
-    pub async fn is_idle(&self) -> bool {
-        *self.download_state.read().await == DownloadState::Idle
-    }
-
-    /// 是否下载中
-    pub async fn is_downloading(&self) -> bool {
-        *self.download_state.read().await == DownloadState::Downloading
-    }
-
-    /// 是否已暂停
-    pub async fn is_paused(&self) -> bool {
-        *self.download_state.read().await == DownloadState::Paused
-    }
-
-    /// 是否已取消
-    pub async fn is_canceled(&self) -> bool {
-        *self.download_state.read().await == DownloadState::Canceled
-    }
-
-    /// 设置下载状态
-    pub async fn set_download_state(&self, state: DownloadState) {
-        *self.download_state.write().await = state;
+    /// 返回当前下载状态
+    pub fn get_download_state(&self) -> DownloadState {
+        self.download_state.get()
     }
 
     /// 更新下载状态，返回旧值
-    pub async fn update_download_state(&self, state: DownloadState) -> DownloadState {
-        let old = *self.download_state.read().await;
-        *self.download_state.write().await = state;
+    pub fn set_download_state(&self, state: DownloadState) {
+        self.download_state.set(state);
+    }
+
+    /// 更新下载状态，返回旧值
+    pub fn update_download_state(&self, state: DownloadState) -> DownloadState {
+        let old = self.download_state.get();
+        self.download_state.set(state);
         old
     }
 
-    /// 执行下载解析和下载任务
+    /// 当前下载状态是否空闲
+    fn is_idle(&self) -> bool {
+        self.download_state.get() == DownloadState::Idle
+    }
+
+    /// 当前是否正在下载
+    fn is_downloading(&self) -> bool {
+        self.download_state.get() == DownloadState::Downloading
+    }
+
+    /// 任务是否暂停状态
+    fn is_paused(&self) -> bool {
+        self.download_state.get() == DownloadState::Paused
+    }
+
+    /// 任务是否情取消
+    fn is_canceled(&self) -> bool {
+        self.download_state.get() == DownloadState::Canceled
+    }
+
+    /// 下载实现
     pub async fn download(
         &self,
-        config: DownloadConfig,
-        tx: mpsc::Sender<ChannelMessage>,
+        user_config: &UserConfig,
+        tx: channel::Sender<ChannelMessage>,
     ) -> Result<(), Box<dyn Error>> {
-        let client = Arc::new(
+        let client = Rc::new(
             Client::builder()
-                .connect_timeout(Duration::from_secs(config.connect_timeout))
+                .connect_timeout(Duration::from_secs(user_config.connect_timeout))
                 .user_agent(APP_USER_AGENT)
                 .build()?,
         );
 
-        // 新下载任务
-        // 待下载的分片、保存路径
-        if self.is_idle().await {
-            self.parse_m3u8(&config.m3u8_url, Arc::clone(&client), &config.save_path)
+        let (segments, save_path, segments_len) = if self.is_idle() {
+            let all_segments = self
+                .parse_m3u8(&client, &user_config.m3u8_url, &user_config.save_path)
                 .await?;
-        }
+            let segments_len = all_segments.len();
 
-        let segments = self.segments.lock().await.clone();
-        let segments_len = segments.len();
-        let save_path = self.save_path.lock().await.clone();
+            // 删除下载失败的文件（若存在）
+            let failed_file_path = user_config.save_path.join(FAILED_FILENAME);
+            if failed_file_path.is_file() {
+                fs::remove_file(failed_file_path).await?;
+            }
 
-        tx.send(ChannelMessage::Start {
-            total_nums: segments_len,
-            is_new_download: self.is_idle().await,
-        })
-        .await?;
+            (all_segments, user_config.save_path.clone(), segments_len)
+        } else {
+            // 过滤掉已下载的
+            let all_segments = self.all_segments.borrow();
+            let downloaded = self.downloaded_segments.borrow();
+            let wait_download_segments = all_segments
+                .iter()
+                .filter(|&item| !downloaded.contains(&item.name))
+                .cloned()
+                .collect();
 
-        // 将下载状态置为下载中
-        self.set_download_state(DownloadState::Downloading).await;
+            (wait_download_segments, self.save_path.borrow().clone(), 0)
+        };
 
-        // 并发数
-        let concurrency = config.concurrency.min(segments_len);
+        let _ = tx
+            .send(ChannelMessage::Start {
+                total_nums: segments_len,
+                is_new_download: self.is_idle(),
+            })
+            .await;
 
-        // 并发下载，第一次不重试，全部下载后若有下载失败的，再决定是否再集中重试
+        self.set_download_state(DownloadState::Downloading);
+
+        // 并发下载
+        let concurrency = user_config.concurrency.min(segments_len);
         self.future_download(
             segments,
             &save_path,
-            Arc::clone(&client),
+            &client,
             concurrency,
-            1,
+            user_config.retry_count,
             tx.clone(),
         )
         .await;
 
-        // 任务因暂停而提前结束，但可能还继续下载
-        if self.is_paused().await {
-            // 排除已下载的分片
-            let new_segments = self
-                .segments
-                .lock()
-                .await
-                .iter()
-                .filter(|s| !self.downloaded_segments.contains(&s.name))
-                .cloned()
-                .collect::<Vec<Segment>>();
-            // 更新待下载分片
-            self.segments.lock().await.clone_from(&new_segments);
-            // 清除下载失败的分片，重试时重新下载
-            self.failed_segments.lock().await.clear();
+        // 任务并发下载结束，但可能是由于暂停或取消导致的
 
+        // 暂停
+        if self.is_paused() {
             let _ = tx.send(ChannelMessage::Paused).await;
             return Ok(());
         }
 
-        // 任务提前取消
-        if self.is_canceled().await {
-            self.clear().await;
+        // 取消
+        if self.is_canceled() {
+            self.clear();
             let _ = tx.send(ChannelMessage::Canceled).await;
             return Ok(());
         }
 
-        // 任务正常结束
+        // 正常下载结束
 
-        // 重试
-        let failed_segments = {
-            let mut guard = self.failed_segments.lock().await;
-            let clone = guard.clone();
-            guard.clear();
-            clone
-        };
-        if !failed_segments.is_empty() && config.retry > 0 {
-            let _ = tx.send(ChannelMessage::Retry).await;
-            self.future_download(
-                failed_segments,
-                &save_path,
-                client,
-                concurrency,
-                config.retry,
-                tx.clone(),
-            )
-            .await;
-        }
-
-        // 构建最终消息
+        let failed_nums = self.failed_segments.borrow().len();
         let mut final_msg = String::from("Successfully downloaded!");
 
-        let failed_nums = self.failed_segments.lock().await.len();
         if failed_nums > 0 {
             final_msg = format!("{} failed to download.", failed_nums);
-
-            // 记录下载失败的分片
-            if let Ok(mut file) = File::create(save_path.join(FAILED_FILENAME)).await {
-                let failed_segments = self.failed_segments.lock().await;
-                let mut buffer = String::new();
-                for segment in failed_segments.iter() {
-                    buffer.push_str(&format!("{} - {}\n", segment.name, segment.download_url));
-                }
-                file.write_all(buffer.as_bytes()).await?;
-            }
         } else {
             // 合并分片
-            if config.is_merge {
+            if user_config.is_merge {
                 let _ = tx.send(ChannelMessage::Merging).await;
-                let m3u8_path = save_path.join(M3U8_FILENAME).to_string_lossy().to_string();
-                let mp4_path = save_path
-                    .join(format!("{}.mp4", config.video_name))
-                    .to_string_lossy()
-                    .to_string();
-                // 构建合并参数
-                // :todo 待优化
-                let args = vec!["-i", &m3u8_path, "-c", "copy", "-y", &mp4_path];
-                let downloaded_segments = self
-                    .downloaded_segments
-                    .iter()
-                    .map(|s| s.key().clone())
-                    .collect::<Vec<String>>();
-
-                match merge_and_delete(
-                    args,
-                    config.is_delete_segment,
-                    downloaded_segments,
-                    &save_path,
-                )
-                .await
+                match self
+                    .merge_segments(
+                        &save_path,
+                        user_config.is_delete_segment,
+                        &user_config.video_name,
+                    )
+                    .await
                 {
                     Ok(msg) => {
                         final_msg = msg;
@@ -323,7 +383,6 @@ impl DownloadManager {
             }
         }
 
-        // 更新UI
         let _ = tx
             .send(ChannelMessage::Downloaded {
                 message: final_msg,
@@ -331,9 +390,113 @@ impl DownloadManager {
             })
             .await;
 
-        self.clear().await; // 重置
+        self.clear();
 
         Ok(())
+    }
+
+    /// 合并分片
+    async fn merge_segments(
+        &self,
+        save_path: &Path,
+        is_delete_segment: bool,
+        video_name: &str,
+    ) -> Result<String, io::Error> {
+        let m3u8_path = save_path.join(M3U8_FILENAME).to_string_lossy().to_string();
+        let mp4_path = save_path
+            .join(format!("{}.mp4", video_name))
+            .to_string_lossy()
+            .to_string();
+        let args = ["-i", &m3u8_path, "-c", "copy", "-y", &mp4_path];
+
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(args);
+
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000);
+
+        let status = cmd.spawn()?.status().await?;
+
+        if !status.success() {
+            return Err(io::Error::other("Failed to merge the segments."));
+        }
+
+        let mut msg = String::from("Successfully merged!");
+
+        if is_delete_segment {
+            // 删除 m3u8 文件
+            let _ = fs::remove_file(save_path.join(M3U8_FILENAME)).await;
+
+            let deleted_counter = Rc::new(Cell::new(0));
+            let downloaded_segments = self.downloaded_segments.borrow().clone();
+            let save_path = Rc::new(save_path.to_path_buf());
+            // 并发删除分片
+            futures::stream::iter(downloaded_segments.iter())
+                .for_each_concurrent(DELETE_CONCURRENCY, |item| {
+                    let save_path_clone = Rc::clone(&save_path);
+                    let deleted_counter = Rc::clone(&deleted_counter);
+
+                    async move {
+                        let filepath = save_path_clone.join(item);
+                        if filepath.is_file() && fs::remove_file(&filepath).await.is_ok() {
+                            deleted_counter.update(|v| v + 1);
+                        }
+                    }
+                })
+                .await;
+
+            let deleted = deleted_counter.get();
+            msg.push_str(&format!(
+                " {} segment{} have been deleted.",
+                deleted,
+                if deleted > 1 { "s" } else { "" }
+            ));
+        }
+
+        Ok(msg)
+    }
+
+    /// 解析M3U8，自动选择大师列表最高分辨率，自动选择文件扩展名
+    ///
+    /// 将总分片和保存路径写入 DownloadManager
+    async fn parse_m3u8(
+        &self,
+        client: &Rc<Client>,
+        m3u8_url: &str,
+        save_path: &Path,
+    ) -> Result<Vec<Segment>, Box<dyn Error>> {
+        let mut base_url = Url::parse(m3u8_url)?.join(".")?;
+        let mut content = fetch_m3u8_content(client, m3u8_url).await?;
+
+        // 处理大师列表多个分辨率
+        if content.contains("#EXT-X-STREAM-INF") {
+            let best_url = parse_m3u8_master(&content)?;
+
+            if best_url.is_empty() {
+                return Err("Invalid master playlist.".into());
+            }
+
+            let final_url = build_abs_url(&base_url, &best_url)?;
+            // 获取高分辨率的M3U8内容
+            content = fetch_m3u8_content(client, final_url.as_str()).await?;
+            // 重新构建base url
+            base_url = Url::parse(final_url.as_str())?.join(".")?;
+        }
+
+        // 提取第一个分片，确定视频后缀
+        let suffix = extract_suffix_from_m3u8_content(client, &base_url, &content).await?;
+        let segments = extract_segments(&content, &base_url, save_path, &suffix).await?;
+
+        if segments.is_empty() {
+            return Err("No segments found.".into());
+        }
+
+        self.all_segments.borrow_mut().clone_from(&segments);
+        self.save_path
+            .borrow_mut()
+            .clone_from(&save_path.to_path_buf());
+
+        Ok(segments)
     }
 
     /// 使用 futures::stream 并发下载
@@ -341,22 +504,22 @@ impl DownloadManager {
         &self,
         segments: Vec<Segment>,
         save_path: &Path,
-        client: Arc<Client>,
+        client: &Rc<Client>,
         concurrency: usize,
-        max_retries: u32,
-        tx: mpsc::Sender<ChannelMessage>,
+        retry_count: u32,
+        tx: channel::Sender<ChannelMessage>,
     ) {
         futures::stream::iter(segments)
             .for_each_concurrent(concurrency, move |segment| {
-                let client = Arc::clone(&client);
+                let client = Rc::clone(client);
                 let tx_clone = tx.clone();
 
                 async move {
-                    if !self.is_downloading().await {
+                    if !self.is_downloading() {
                         return;
                     }
 
-                    self.download_single_segment(client, save_path, segment, tx_clone, max_retries)
+                    self.download_single_segment(client, save_path, segment, tx_clone, retry_count)
                         .await;
                 }
             })
@@ -366,47 +529,59 @@ impl DownloadManager {
     /// 下载单个分片
     async fn download_single_segment(
         &self,
-        client: Arc<Client>,
+        client: Rc<Client>,
         save_path: &Path,
         segment: Segment,
-        tx: mpsc::Sender<ChannelMessage>,
-        max_retries: u32,
+        tx: channel::Sender<ChannelMessage>,
+        retry_count: u32,
     ) {
-        for attempt in 0..max_retries {
+        for attempt in 0..retry_count {
             match self
                 .try_download_segment(&client, save_path, &segment)
                 .await
             {
                 Ok(segment_size) => {
                     // 记录下载成功的分片
-                    self.downloaded_segments.insert(segment.name.clone());
+                    self.downloaded_segments.borrow_mut().push(segment.name);
                     // 更新下载数
-                    let downloaded_nums = self.downloaded_nums.fetch_add(1, Ordering::Relaxed) + 1;
+                    self.downloaded_nums.update(|v| v + 1);
                     // 更新文件总大小
-                    let downloaded_sizes = self
-                        .downloaded_sizes
-                        .fetch_add(segment_size, Ordering::Relaxed)
-                        + segment_size;
+                    self.downloaded_sizes.update(|v| v + segment_size);
+
                     // UI进度
                     let _ = tx
                         .send(ChannelMessage::Progress {
-                            downloaded_nums,
-                            downloaded_sizes,
+                            downloaded_nums: self.downloaded_nums.get(),
+                            downloaded_sizes: self.downloaded_sizes.get(),
                         })
                         .await;
 
                     return;
                 }
-                Err(_) if attempt < max_retries - 1 => {
+                Err(_) if attempt < retry_count - 1 => {
                     let delay = Duration::from_secs(2 * 2u64.pow(attempt));
-                    sleep(delay).await;
+                    Timer::after(delay).await;
                 }
                 Err(_) => break,
             }
         }
 
-        // 记录下载失败的切片，任务结束后再写入文件
-        self.failed_segments.lock().await.push(segment);
+        // 记录下载失败的切片
+        let failed_path = save_path.join(FAILED_FILENAME);
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(failed_path)
+            .await
+        {
+            let _ = file
+                .write_all(format!("{} - {}\n", segment.name, segment.download_url).as_bytes())
+                .await;
+            let _ = file.flush().await;
+        }
+        self.failed_segments.borrow_mut().push(segment);
+
+        // self.failed_segments.lock().await.push(segment);
     }
 
     /// 下载分片+流式写入+记录成功 or 失败
@@ -438,112 +613,6 @@ impl DownloadManager {
 
         writer.flush().await?;
         Ok(total_size)
-    }
-
-    async fn parse_m3u8(
-        &self,
-        m3u8_url: &str,
-        client: Arc<Client>,
-        save_path: &Path,
-    ) -> Result<(), Box<dyn Error>> {
-        let mut base_url = Url::parse(m3u8_url)?.join(".")?;
-        let mut content = fetch_m3u8_content(&client, m3u8_url).await?;
-
-        // 处理大师列表多个分辨率
-        if content.contains("#EXT-X-STREAM-INF") {
-            let best_url = parse_m3u8_master(&content)?;
-
-            if best_url.is_empty() {
-                return Err("Invalid master playlist.".into());
-            }
-
-            let final_url = build_abs_url(&base_url, &best_url)?;
-            // 获取高分辨率的M3U8内容
-            content = fetch_m3u8_content(&client, final_url.as_str()).await?;
-            // 重新构建base url
-            base_url = Url::parse(final_url.as_str())?.join(".")?;
-        }
-
-        // 提取第一个分片，确定视频的 MIME 类型
-        let suffix = extract_suffix_from_m3u8_content(&client, &base_url, &content).await?;
-        let segments = extract_segments(&content, &base_url, save_path, &suffix).await?;
-
-        if segments.is_empty() {
-            return Err("No segments found.".into());
-        }
-
-        self.segments.lock().await.clone_from(&segments);
-
-        self.save_path
-            .lock()
-            .await
-            .clone_from(&save_path.to_path_buf());
-
-        Ok(())
-    }
-}
-
-impl Default for DownloadManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// 用户下载配置
-#[derive(Debug)]
-pub struct DownloadConfig {
-    save_path: PathBuf,
-    video_name: String,
-    m3u8_url: String,
-    concurrency: usize,
-    retry: u32,
-    connect_timeout: u64,
-    is_merge: bool,
-    is_delete_segment: bool,
-}
-
-impl DownloadConfig {
-    /// 创建新的下载任务配置
-    pub async fn new(
-        ui: &AppWindow,
-        download_manager: &Arc<DownloadManager>,
-    ) -> Result<Self, Box<dyn Error>> {
-        let video_name = ui.get_video_name();
-
-        let (save_path, video_name, m3u8_url) = if download_manager.is_idle().await {
-            let (save_path, video_name) =
-                create_safe_save_path(&ui.get_work_dir(), &video_name).await?;
-            let m3u8_url = ui.get_m3u8_url().to_string();
-
-            if Url::parse(&ui.get_m3u8_url()).is_err() {
-                return Err("Invalid M3U8 URL".into());
-            };
-
-            (save_path, video_name, m3u8_url)
-        } else {
-            (PathBuf::default(), video_name.into(), String::default())
-        };
-
-        let concurrency = ui.get_concurrency().parse::<usize>().unwrap_or(4);
-        if concurrency < 1 {
-            return Err("Concurrency cannot be less than 1".into());
-        }
-
-        let connect_timeout = ui.get_connect_timeout().parse::<u64>().unwrap_or(3);
-        if connect_timeout < 1 {
-            return Err("Connect timeout cannot be less than 1 second".into());
-        }
-
-        Ok(Self {
-            save_path,
-            video_name,
-            m3u8_url,
-            concurrency,
-            connect_timeout,
-            retry: ui.get_retry().parse().unwrap_or(3),
-            is_merge: ui.get_is_merge(),
-            is_delete_segment: ui.get_is_delete_segment(),
-        })
     }
 }
 
@@ -582,7 +651,7 @@ async fn create_safe_save_path(
 }
 
 /// 获取M3U8内容，验证非空、content-type
-async fn fetch_m3u8_content(client: &Arc<Client>, url: &str) -> Result<String, Box<dyn Error>> {
+async fn fetch_m3u8_content(client: &Rc<Client>, url: &str) -> Result<String, Box<dyn Error>> {
     let resp = client.get(url).send().await?;
     if !resp.status().is_success() {
         return Err(format!("{}", resp.status()).into());
@@ -605,15 +674,6 @@ async fn fetch_m3u8_content(client: &Arc<Client>, url: &str) -> Result<String, B
     }
 
     Ok(text)
-}
-
-/// 构建绝对URL
-fn build_abs_url(base: &Url, uri: &str) -> Result<Url, Box<dyn Error>> {
-    if uri.starts_with("http://") || uri.starts_with("https://") {
-        Ok(Url::parse(uri)?)
-    } else {
-        Ok(base.join(uri)?)
-    }
 }
 
 /// 解析大师列表
@@ -651,9 +711,18 @@ fn parse_m3u8_master(content: &str) -> Result<String, Box<dyn Error>> {
     Ok(best_url)
 }
 
+/// 构建绝对URL
+fn build_abs_url(base: &Url, uri: &str) -> Result<Url, Box<dyn Error>> {
+    if uri.starts_with("http://") || uri.starts_with("https://") {
+        Ok(Url::parse(uri)?)
+    } else {
+        Ok(base.join(uri)?)
+    }
+}
+
 /// 提取视频内容 mime 类型，返回文件后缀名，目前暂支持以 image/ 开头的
 async fn extract_suffix_from_m3u8_content(
-    client: &Arc<Client>,
+    client: &Rc<Client>,
     base_url: &Url,
     content: &str,
 ) -> Result<String, Box<dyn Error>> {
@@ -740,57 +809,4 @@ async fn extract_segments(
     writer.flush().await?;
 
     Ok(segments)
-}
-
-/// 合并为MP4、删除分片
-async fn merge_and_delete(
-    args: Vec<&str>,
-    is_delete_segment: bool,
-    downloaded_segments: Vec<String>,
-    save_path: &Path,
-) -> Result<String, io::Error> {
-    let mut cmd = Command::new("ffmpeg");
-    cmd.args(args);
-
-    #[cfg(windows)]
-    cmd.creation_flags(0x08000000);
-
-    let status = cmd.spawn()?.wait().await?;
-
-    // 合并失败
-    if !status.success() {
-        return Err(io::Error::other("Failed to merge the segments."));
-    }
-
-    let mut msg = String::from("Successfully merged!");
-
-    // 删除所有分片，包括key
-    if is_delete_segment {
-        // 删除 m3u8 文件
-        let _ = fs::remove_file(save_path.join(M3U8_FILENAME)).await;
-        // 已删除文件数
-        // :todo 待优化
-        let deleted_counter = Arc::new(AtomicU32::new(0));
-
-        futures::stream::iter(downloaded_segments)
-            .for_each_concurrent(DELETE_CONCURRENCY, |item| {
-                let deleted_counter = Arc::clone(&deleted_counter);
-                async move {
-                    let filepath = save_path.join(item);
-                    if filepath.is_file() && fs::remove_file(&filepath).await.is_ok() {
-                        deleted_counter.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            })
-            .await;
-
-        let deleted = deleted_counter.load(Ordering::Relaxed);
-        msg.push_str(&format!(
-            " {} segment{} have been deleted.",
-            deleted,
-            if deleted > 1 { "s" } else { "" }
-        ));
-    }
-
-    Ok(msg)
 }
