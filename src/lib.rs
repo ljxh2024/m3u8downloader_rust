@@ -123,6 +123,11 @@ pub fn run() -> Result<(), slint::PlatformError> {
         }
     });
 
+    // 使用浏览器打开链接
+    window.on_open_url(|url|{
+        open::that(url).unwrap();
+    });
+
     window.run()
 }
 

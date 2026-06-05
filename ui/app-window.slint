@@ -67,6 +67,8 @@ export component AppWindow inherits Window {
     // 显示消息文本，arg_0:消息文本,arg_1:消息文本是否为错误类型
     callback show-message(string, bool);
 
+    callback open-url(string);
+
     // 下载中的界面状态(点击下载或继续下载按钮时先触发)
     function start-parse() {
         enable-start-btn = false;
@@ -285,7 +287,7 @@ export component AppWindow inherits Window {
                     TouchArea {
                         mouse-cursor: pointer;
                         clicked => {
-                            Platform.open-url(root.github);
+                            root.open-url(root.github);
                         }
                     }
                 }
