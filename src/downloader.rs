@@ -592,7 +592,7 @@ impl DownloadManager {
         self.failed_segments.borrow_mut().push(segment);
     }
 
-    /// 下载分片+流式写入+记录成功 or 失败
+    /// 下载分片,流式写入
     ///
     /// # Returns
     /// * `Result<usize, Box<dyn Error>>` 文件大小
@@ -778,7 +778,7 @@ async fn extract_segments(
             let new_key_name = "key.key";
 
             writer
-                .write_all(format!("{}\n", line.replace(key, &new_key_name)).as_bytes())
+                .write_all(format!("{}\n", line.replace(key, new_key_name)).as_bytes())
                 .await?;
 
             segments.push(Segment {
