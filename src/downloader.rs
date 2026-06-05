@@ -283,7 +283,7 @@ impl DownloadManager {
                 .build()?,
         );
 
-        // 待下载分片、保存目录、原分片总数
+        // 待下载分片、保存目录、待下载分片总数
         let (segments, save_path, segments_len) = if self.is_idle() {
             let all_segments = self
                 .parse_m3u8(&client, &user_config.m3u8_url, &user_config.save_path)
@@ -301,22 +301,28 @@ impl DownloadManager {
             // 过滤掉已下载的
             let all_segments = self.all_segments.borrow();
             let downloaded = self.downloaded_segments.borrow();
-            let wait_download_segments = all_segments
+            let wait_download_segments: Vec<Segment> = all_segments
                 .iter()
                 .filter(|&item| !downloaded.contains(&item.name))
                 .cloned()
                 .collect();
+            let segments_len = wait_download_segments.len();
 
-            (wait_download_segments, self.save_path.borrow().clone(), all_segments.len())
+            (
+                wait_download_segments,
+                self.save_path.borrow().clone(),
+                segments_len,
+            )
         };
 
-        let _ = tx
-            .send(ChannelMessage::Start {
-                total_nums: segments_len,
-                is_new_download: self.is_idle(),
-            })
-            .await;
+        // 只有是新下载任务时才更新分片总数
+        tx.send(ChannelMessage::Start {
+            total_nums: segments_len,
+            is_new_download: self.is_idle(),
+        })
+        .await?;
 
+        // 任务标记为正在下载
         self.set_download_state(DownloadState::Downloading);
 
         // 并发限制
@@ -360,11 +366,7 @@ impl DownloadManager {
             if user_config.is_merge {
                 let _ = tx.send(ChannelMessage::Merging).await;
                 match self
-                    .merge_segments(
-                        &save_path,
-                        user_config.is_delete_segment,
-                        &user_config.video_name,
-                    )
+                    .merge_segments(user_config.is_delete_segment, &user_config.video_name)
                     .await
                 {
                     Ok(msg) => {
@@ -395,16 +397,26 @@ impl DownloadManager {
     /// 合并分片
     async fn merge_segments(
         &self,
-        save_path: &Path,
         is_delete_segment: bool,
         video_name: &str,
     ) -> Result<String, io::Error> {
+        let save_path = self.save_path.borrow().clone();
+
         let m3u8_path = save_path.join(M3U8_FILENAME).to_string_lossy().to_string();
         let mp4_path = save_path
             .join(format!("{}.mp4", video_name))
             .to_string_lossy()
             .to_string();
-        let args = ["-i", &m3u8_path, "-c", "copy", "-y", &mp4_path];
+        let args = [
+            "-allowed_extensions",
+            "ALL",
+            "-i",
+            &m3u8_path,
+            "-c",
+            "copy",
+            "-y",
+            &mp4_path,
+        ];
 
         let mut cmd = Command::new("ffmpeg");
         cmd.args(args);
@@ -749,7 +761,6 @@ async fn extract_segments(
         .count();
     let mut segments: Vec<Segment> = Vec::with_capacity(segment_count);
     let mut writer = BufWriter::new(File::create(save_path.join(M3U8_FILENAME)).await?);
-    let mut key_index = 1u32;
     let mut segment_index = 0u32;
 
     for line in content.lines() {
@@ -764,18 +775,16 @@ async fn extract_segments(
                 .and_then(|s| s.split('"').next())
                 .unwrap_or("");
             let download_url = build_abs_url(base_url, key)?.to_string();
-            let new_key_name = format!("key_{}.key", key_index);
+            let new_key_name = "key.key";
 
             writer
                 .write_all(format!("{}\n", line.replace(key, &new_key_name)).as_bytes())
                 .await?;
 
             segments.push(Segment {
-                name: new_key_name,
+                name: new_key_name.to_string(),
                 download_url,
             });
-
-            key_index += 1;
         } else if !line.starts_with("#") {
             let download_url = build_abs_url(base_url, line)?.to_string();
             let segment_name = format!("segment_{}{suffix}", segment_index);
